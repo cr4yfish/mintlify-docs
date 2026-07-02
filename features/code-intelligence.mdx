@@ -1,0 +1,277 @@
+---
+title: "Code intelligence"
+description: "How Genie models, analyzes, and reasons about the code it builds for you"
+---
+
+Genie builds apps from natural language, and to do that well it keeps a rich,
+living model of every project it touches. This page covers the systems behind
+that: the **code graph**, the **code explorer**, the **Palantir** analysis and
+consult surfaces, **dreaming** and root-cause analysis, **autofix triggers**,
+**next-prompt prediction**, and **user profiling and memory**.
+
+<Note>
+  Most of these are internal platform features. Some surface to you indirectly
+  (better answers, pre-filled suggestions, self-healing deploys); others are
+  admin-only. You never have to configure them.
+</Note>
+
+## The code graph
+
+Every project has exactly one **code graph**: a versioned graph of its symbols
+(`code_node` — modules, classes, functions, methods, types, and more) and the
+relationships between them (`code_edge` — `calls`, `imports`, `contains`,
+`extends`, `implements`, `reads`, `references_type`, and others). The graph
+powers semantic search over your code, structural questions ("who calls this?"),
+change-impact analysis, and the project Brain view.
+
+### Temporal model
+
+The graph is fully versioned. Each node and edge carries a lifetime expressed in
+**deployment ids**, stored in side tables (`code_node_lifetime` /
+`code_edge_lifetime`) rather than on the node itself. A lifetime is one or more
+`(present_from, present_to)` intervals, so you can query the graph at any point
+in history with the same predicate shape — `asOf(D)`. Querying "now" is just
+`asOf` the latest deployment.
+
+Because lifetime lives in a separate table that allows **multiple intervals per
+node**, rollback becomes a pure-SQL operation: a rollback creates a new
+deployment, then opens intervals for nodes alive at the restored point and closes
+intervals for nodes that only exist in the current head. No re-parsing, no
+re-embedding, no id remapping. A symbol that gets removed and later re-introduced
+gets a second interval row, never a duplicate identity. Embeddings persist even
+for closed nodes, which makes reopens free and lets semantic search run `asOf`
+any historical deployment.
+
+### Query ranking and exact line spans
+
+The agent's primary code-graph tool answers "where is X", "who calls X", and
+free-text semantic questions. Two enrichments land the agent on the exact code
+faster:
+
+- **Exact line spans.** Every result carries `startLine`/`endLine` (from
+  `code_node_version`), so the agent opens `src/Foo.tsx:120-148` directly instead
+  of re-reading the whole file.
+- **A structural ranking prior.** When candidates tie on relevance, the graph
+  folds in **in-degree** — the "god node" signal of how many symbols depend on a
+  target — as a strict tiebreak. It never overrides a clearly more relevant hit;
+  it only breaks near-ties, defaults to 0 when absent, and is stripped from what
+  the agent sees.
+
+Both signals ride along in the same database round-trip, so the hot path stays
+under a second. The code graph also rides *inside* the `bash` tool: on every
+discovery command, the agent's search intent is semantically matched and the top
+few relevant existing symbols are attached to the result (path, symbol, kind,
+line range, reason) so the agent can jump straight to the code.
+
+### Structural analytics and change impact
+
+On top of the graph, Genie computes whole-graph analytics without any
+re-extraction:
+
+- **Graph stats** — node/edge counts, connected components, communities, average
+  degree, density.
+- **God nodes** — the most depended-upon symbols, ranked by in-degree.
+- **Communities** — label-propagation clusters, each named after its most-central
+  member (its hub).
+- **Change impact** — the blast radius of editing a set of files: which symbols
+  transitively depend on them, and which product goals/features the change
+  touches. Impact walks dependency edges backward, because "what breaks if `B`
+  changes" is the set of nodes that can reach `B`.
+
+Every traversal is hard-capped (bounded BFS visits, impact depth, result sizes,
+and DB slice sizes), and results are deterministic — nodes process in sorted-id
+order so the same graph always yields the same communities and paths.
+**Boilerplate** (shadcn primitives, generated types, config, framework
+scaffolding) is down-ranked, not hidden, so your own code leads. These signals
+surface in the project **Brain "Insights" panel** (Search, Analytics, Impact),
+each block with a **Copy JSON** export.
+
+### Goals and bugs as first-class nodes
+
+The graph is extensible by design — new node kinds reuse the same lifetime,
+embedding, and rollback machinery for free:
+
+- **Goals (the feature tree).** A goal is a `code_node` with `kind = 'goal'`
+  representing a feature, capability, or intent — not a chunk of code. Goals form
+  a tree (App → area → feature → capability) whose leaves link to the code that
+  realizes them via `realized_by` edges. This lets Genie avoid building duplicate
+  features (new goals are embedded and de-duplicated against the existing tree),
+  answer "which feature does this file belong to?", and debug in natural language
+  ("[Feature] Google login doesn't work" resolves to a goal, then to the exact
+  code). The tech-lead agent writes goals in a `todo` state when a plan is
+  produced; the code agent flips each to `implemented` as it checks off steps,
+  and every transition is logged.
+- **Bugs.** A bug is a `code_node` with `kind = 'bug'` plus a thin satellite
+  table and an append-only status log. It connects to the exact file and line via
+  an `affects` edge, carries `status`/`severity`/`origin`, and is filed by the
+  tech-lead and scoped code agents through a shared `report_bug` tool.
+  Check-off is **deterministic**: a bug resolves through an explicit
+  `resolve_bug` call or when its linked plan step is marked done successfully —
+  never inferred from model prose.
+
+### Write concurrency
+
+Graph extraction fires per write tool call, in the background, so a single agent
+turn — or parallel agents on the same project — can run several extraction
+transactions at once against the same graph. To avoid Postgres deadlocks on
+overlapping `code_node` rows, each extraction takes a **transaction-scoped
+advisory lock keyed on the project id** as its first statement. Different
+projects never block each other; concurrent extractions for the same project
+queue cleanly instead of deadlocking and silently dropping graph updates.
+
+## Code explorer
+
+The **code explorer** is an admin-only, VSCode-like read-only view of a
+project's deployed source, rendered in place of the live preview iframe. An admin
+toggles between preview and code in the chat header; the explorer fetches the
+project's S3 archive server-side (behind an admin + session check), unzips it,
+filters out `node_modules`/build output/binaries, and renders a file tree with
+syntax highlighting. Large files are truncated and flagged, and the client caches
+the file list briefly so re-opening the view is instant.
+
+## Palantir: analysis and consult
+
+**Palantir** is Genie's pattern-analysis system. It comes in two forms with very
+different scopes.
+
+### GeniePalantir (admin)
+
+GeniePalantir is an **admin-only** chat agent that reads across the *entire*
+platform — every user, project, wallet, ledger entry, and activity record — to
+help admins find patterns without writing SQL. It runs as a bounded tool-loop
+agent (Sonnet, capped steps) whose read tools bypass RLS. It is **read-first**:
+every answer is sourced from rows a tool actually returned, never invented. Admins
+ask questions like "which users started a project but never came back?" or "is
+there a pattern in who churns after their first deploy fails?" and get the pattern
+narrated back with the receipts inline.
+
+### consult_palantir (scoped, for every user)
+
+`consult_palantir` is the safe, RLS-bounded sibling exposed to the **workspace
+chat agent** so ordinary users can ask numeric, correlational questions about
+*their own* usage — token/credit burn, completion latency, week-over-week changes,
+and spend/latency anomalies. It spins up a small bounded sub-agent (Sonnet, capped
+at 6 steps) with a focused analytics tool surface, then hands its written answer
+back to the chat agent.
+
+The scope boundary is enforced in code, not by the model:
+
+- Every project-scoped tool verifies its `projectId` against the caller's real
+  access under RLS, and **fails closed** — a foreign, archived, or unconfirmable
+  project is rejected and no query runs.
+- User-level aggregates are pinned to the caller; there is no parameter that names
+  a different user.
+- No fleet-wide tools exist in the scoped set, so the agent literally cannot reach
+  outside your workspace.
+
+## Dreaming and root-cause analysis
+
+**Dreaming** is Genie's nightly background self-improvement pass. The dreaming
+agent distills the last 24 hours of step traces (`step_failed`, `step_notes`,
+`step_blocking`) into a `dream_report`: a list of recurring tool/prompt failure
+patterns, each with a severity and a one-line suggested action. That tells you
+*what* keeps breaking.
+
+### Root-cause pass
+
+A chained **GeniePalantir root-cause pass** runs on the same cron, right after the
+report is written. For every issue at medium severity and above, it finds the
+deeper root cause behind the symptom, surfaces related underlying issues, and
+drafts a brief one-or-two-sentence fix. It is a single bounded model call (not a
+tool loop), hard-capped in issue count and output size, and **never invents ids** —
+the model only sees issue text, while node/project provenance is carried across
+from the source issue. The pass is non-fatal: the dream report is already
+persisted, so a failure just logs and the cron still succeeds.
+
+### Ticking issues off
+
+Each dream-report issue can be marked **handled** so it stops reading as
+outstanding. Handled state lives in its own `dream_issue_status` table (keyed by a
+stable `category::title` issue key, upserted so re-toggling never piles up
+history). You can tick issues off from the admin dreaming page — with an optional
+resolution note and a per-report `N / M handled` count — or through GeniePalantir's
+`set_dream_issue_handled` tool. That write is internal and reversible, so, unlike
+opening a fix PR, it doesn't require an explicit confirm.
+
+## Autofix triggers
+
+**Autofix** lets a failing deploy or a crashing preview repair itself. It is
+reachable through one endpoint, `POST /api/autofix`, which accepts two request
+shapes:
+
+- **Deploy failure** — carries a `deploymentId`; the LLM reads CodeBuild logs on
+  demand.
+- **Runtime failure** — carries an `error` and/or `logs`, inlined into a hidden
+  repair prompt.
+
+Client-side triggers fire on a detected broken page (React error boundary), an
+uncaught error (`window.onerror` / `unhandledrejection`), or a filtered Supabase
+`console.error`. The hard part is **not fixing the same crash twice**, since one
+crash can fan out into several signals across several tabs. Two layers prevent
+duplicates:
+
+1. **Client mutex (best-effort).** A synchronous in-memory lock plus an early,
+   pre-fetch status flip and a BroadcastChannel claim stop repeat triggers within
+   and across a browser's tabs.
+2. **Server claim (authoritative).** `claimAutoFix` is a single atomic
+   conditional `UPDATE` that flips `auto_fix_tried false → true`; of N concurrent
+   callers exactly one wins and proceeds, the rest get `409`.
+
+External callers (CI, deploy monitors) authenticate with an internal API key and
+resolve identity from the project owner; in-app calls use the session cookie.
+Repair responses come back in your locale.
+
+## Next-prompt prediction
+
+Genie already records, per project, what you asked for and what got built.
+**Next-prompt prediction** turns that history into a forward signal: a small
+ranked set of **predicted next prompts** — the feature, change, or bugfix you're
+most likely to ask for next. When a build turn settles, a `next-prompt-agent`
+reads a context pack distilled from the Brain, the goal tree, prompt history, and
+your profile/memory, and produces ready-to-send prompt strings (each tagged
+`feature`, `change`, or `bugfix`, with a rationale and confidence).
+
+Predictions are **advisory** (never auto-sent — at most a pre-filled composer),
+**cached** (computed once per settled turn, read cheaply until the project moves
+to a new head), and **measurable**. Each prediction is itself a `code_node` with
+`kind = 'prediction'` and a lifetime, so when your next real prompt arrives it is
+matched against live predictions to record a hit or miss — giving precision@k and
+MRR over time, and letting admins ask "what did we predict at deployment 41, and
+did 42 fulfil it?" They surface in the Brain "What's next" panel and as composer
+suggestion chips.
+
+## User profiling and memory
+
+Genie keeps two per-user stores that make the agents more personal. Both are read
+into every chat turn as prompt blocks, and both fall back to a stable empty state
+so a missing profile never blocks a turn.
+
+### Profiling (structured traits)
+
+`user_trait` holds structured, per-user preferences rendered into a
+`<user-profile>` block for both the main code-building agent and the workspace
+chat agent. Because Genie is a no-code platform, profiling only captures
+**abstract, product-level** preferences — design preference, feature priority,
+domain interest, audience, working pattern, and abstract dislikes. Technical
+choices (libraries, frameworks, code style) are explicitly forbidden, so stored
+signal never biases future builds against something you didn't ask for.
+
+Traits are written three ways: a **nightly profiling agent** over your recent
+code-graph activity, an explicit `save_preference` tool used mid-chat, and a
+**sentiment classifier** on your replies. Near-duplicate phrasings are collapsed
+at read time by Voyage-embedding cosine similarity, so the injected block doesn't
+repeat itself. Stale traits decay nightly and drop off below a noise floor. Admin
+views (`/admin/profiles` and the per-user profile page) show the canonical traits,
+the verbatim prompt block, and the dedup summary.
+
+### Memory (free-form snippets)
+
+`user_memory` is the messy long tail: free-text snippets like "User lives in
+Berlin" or "User's team uses pnpm". The workspace chat agent calls a
+`create_memory` tool opportunistically whenever you reveal something durable about
+yourself. Each snippet is embedded (Voyage `voyage-3`, 1024-dim) and de-duplicated
+against the nearest existing memory by cosine similarity — a match at or above 0.9
+bumps the existing row's hit count instead of inserting a copy. The top memories
+by recency are injected into a `<user-memories>` block. Use **traits** when you
+want a rigid taxonomy you can dashboard on, and **memories** for everything that
+doesn't fit one.

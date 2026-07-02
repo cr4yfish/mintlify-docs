@@ -1,0 +1,205 @@
+---
+title: "Component registry"
+description: "How Genie's catalog of vetted UI components and feature blueprints is structured, selected, and installed into generated apps."
+---
+
+The component registry is Genie's catalog of reusable, vetted building blocks that the
+coding agents drop into the apps they generate. Instead of re-synthesising a revenue chart,
+a hero section, or an app shell from scratch on every prompt — which is slow, inconsistent,
+and prone to broken imports and missing dependencies — the agents discover a ready-made
+entry and copy it into your project, where it deploys like any other file.
+
+The catalog holds two kinds of entry:
+
+- **Components** — single UI building blocks: charts, section blocks, layout shells, and
+  decorative backgrounds.
+- **Feature blueprints** — higher-level features that bundle frontend files (a hook, types,
+  a panel) with, for some, a deployed Supabase edge function. `ai-chat` and `pdf-compressor`
+  are the seed blueprints.
+
+Discovery, selection, and installation all work the same way across both kinds; only the
+install step branches on what the entry actually carries.
+
+## How the registry is stored
+
+The source of truth is a dedicated S3 bucket, configured by the
+`COMPONENT_REGISTRY_S3_BUCKET_NAME` environment variable. Authoring an entry updates the
+bucket — no platform deploy is needed. When the variable is unset, discovery degrades
+gracefully to an empty catalog and the agents simply hand-write as before.
+
+The bucket holds a single `manifest.json` (metadata only, never file bodies) plus one S3
+object per source file:
+
+```
+manifest.json                          # the catalog: metadata for every entry
+components/{id}/files/<dest path>       # frontend source files
+components/{id}/edge-functions/<slug>/  # edge-function templates (feature blueprints)
+```
+
+Keeping bodies out of the manifest keeps the discovery payload small — the agent sees
+descriptions, not source — and lets the manifest be cached aggressively (a module-level cache
+with a short TTL, bustable after an upload).
+
+## How entries are structured
+
+Every manifest entry carries LLM-facing metadata that drives both discovery and wiring:
+
+- **`id`** — a stable kebab-case key (for example `revenue-bar-chart`), validated at runtime
+  against the live manifest.
+- **`kind`** — `"component"` or `"feature"`, the discriminator the install step dispatches on.
+- **`category`** — `chart`, `section`, `layout`, or `background` for components; `ai-feature`,
+  `file-feature`, or `integration` for blueprints.
+- **`description` and `tags`** — the primary signal the agent uses to pick an entry, and the
+  text that gets embedded for semantic search.
+- **`files[]`** — frontend files with their destination paths, authored against the project's
+  canonical aliases (`@/components`, `@/lib/utils`).
+- **`dependencies[]`** — npm packages additively merged into the project's `package.json`
+  (existing pins are never downgraded).
+- **`edgeFunctions[]`** — deployed edge functions, empty for pure components.
+- **`usage`** — a ready-to-paste snippet so the agent can wire the entry in without re-reading it.
+
+Components ship plain English copy through props with sensible defaults (for example
+`<HeroSection title="…" />`) — never `next-intl`, because the generated apps do not have i18n
+wired up. Overriding copy is a normal prop edit after install.
+
+## How components are discovered and selected
+
+Discovery is tool-driven; the catalog is never injected into the system prompt. The agents
+hold two read tools, wired into three surfaces — the first-prompt main agent, the tech-lead
+planner (discovery only), and the scoped code agent:
+
+- **`query_registry_components({ query, category?, limit? })`** — semantic search. The agent
+  describes what it wants in natural language; the tool embeds the query (Voyage `voyage-3`)
+  and ranks entries by cosine similarity against each entry's stored embedding, returning
+  compact rows. It falls back to case-insensitive substring matching if no embeddings are
+  available, so discovery degrades rather than hard-fails.
+- **`get_registry_component({ id })`** — full metadata for one entry.
+
+### Proactive recommendations
+
+Leaving the decision to look up to the model is unreliable, so Genie also searches the
+registry proactively. Once the turn's **SUM** (the improved user brief) is known, a durable
+`queryRegistryStep` runs the brief through the search backend and folds the best matches into
+the SUM as a compact `[Registry Recommendations]` block, handed to the agents inline with the
+brief they already read:
+
+```
+[Registry Recommendations]:
+- revenue-bar-chart (component/chart): Revenue Bar Chart — monthly totals. [tags: analytics, kpi]
+- hero-section (component/section): Hero Section — a landing-page hero with headline + CTA.
+```
+
+This runs only on the build paths (first-prompt and follow-up), never in chat mode, and is
+capped at three matches — a focused nudge, not a catalog dump.
+
+<Note>
+  The recommender ranks the whole pool, then keeps only entries that clear an absolute cosine
+  floor **and** a relative band around the top match — so an off-topic entry never gets
+  injected. Near-universal app-shell layouts (`navbar-content-layout`,
+  `sidebar-content-layout`) are exempt from the relative band, so a relevant shell that ranks
+  behind a more specific match is still offered.
+</Note>
+
+Every recommendation decision is logged to DynamoDB and surfaced on the
+`/admin/registry/recommendations` admin page (injection rate, ranking-mode breakdown, recent
+decisions), so the thresholds can be tuned against real traffic.
+
+## How entries are installed
+
+The write-capable agents (the first-prompt main agent and the scoped code agent) hold
+**`add_registry_entry({ id, targetPath })`**, which installs both components and feature
+blueprints. The tech-lead is discovery-only — it names an `id` in its plan, and the scoped
+agent performs the copy.
+
+For frontend files the tool resolves destinations from `targetPath`, rewrites imports against
+the project's aliases, refuses to overwrite conflicting user edits, merges any new
+`package.json` dependencies, and writes everything through the project's existing save path.
+Because the copy routes through that shared closure, the files become instantly readable and
+editable through the normal `find_file` / `edit_file` tools — no extra plumbing, and follow-up
+edits work exactly as they would on any hand-written file.
+
+### Edge functions and schedules
+
+When an entry carries `edgeFunctions[]`, those functions **cannot** be written into the
+project's S3 files directly — that folder is a read-only mirror that a real deploy would
+clobber, and a direct write would skip every safety check. Instead the install routes each
+edge function through the same `deployFunction()` path the edge-functions agent uses:
+
+- Edge functions deploy **before** the frontend files write; a deploy failure surfaces as a
+  tool error without writing partial files.
+- The template's `{{TOKEN}}` placeholders (for example `{{APP_URL}}`, `{{PROJECT_ID}}`) are
+  substituted at copy time.
+- The CORS contract and secret-leak validators run at deploy time, exactly as they do for a
+  hand-written function.
+- Every secret the template references via `Deno.env.get(...)` is declared in
+  `requiredSecrets[]`, so any missing secret produces the same "user action required"
+  surfacing — secrets are never bundled into the entry.
+
+Edge-function dependencies are Deno `npm:<pkg>@<version>` specifiers pinned in the template,
+not `package.json` entries.
+
+<Note>
+  **Scheduled (cron) edge functions are not yet supported.** `deployFunction()` deploys but
+  does not schedule; scheduling is configured separately. A future blueprint that needs a
+  schedule would add a `schedule` field to the edge-function entry and a separate deploy path
+  rather than squeezing it into the current install.
+</Note>
+
+## Component catalog
+
+The registry ships the following entries, grouped by role. Each has a stable `id`, a category,
+and a default destination path in the generated project.
+
+### Layout and section blocks
+
+| Entry | Category | What it is |
+| --- | --- | --- |
+| `navbar-content-layout` | layout | Top-nav application shell wrapping the shadcn navigation menu; responsive, with a mobile sheet. |
+| `sidebar-content-layout` | layout | Sidebar application shell wrapping the shadcn sidebar; off-canvas rail, mobile sheet, `⌘/Ctrl-B` toggle. |
+| `hero-section` | section | Zero-dependency, business-first landing hero with a two-column copy + product-preview layout. |
+| `kanban-board` | section | Self-contained, zero-dependency controlled board view (columns of draggable cards). |
+
+### Data-viz and stat components
+
+| Entry | Category | What it is |
+| --- | --- | --- |
+| `revenue-bar-chart` | chart | The seed chart — a revenue bar chart showing monthly totals. |
+| `metric-line-chart` | chart | Interactive multi-series time-series chart (areas or lines); depends on `recharts`. |
+| `donut-stat-chart` | chart | Part-to-whole donut with a live centre readout and clickable legend; depends on `recharts`. |
+| `stat-card` | chart | KPI tile (`StatCard`) plus a responsive `StatCardGrid`; hand-rolled SVG sparkline, zero dependencies. |
+
+### Interactive and animated components
+
+| Entry | Category | What it is |
+| --- | --- | --- |
+| `grainient` | background | Full-bleed CSS gradient with an SVG film-grain overlay and slow drift; zero dependencies. |
+| `Strands` | background | WebGL "woven light" background with an optional refractive glass-ball mode; renders via `ogl`. |
+| `BorderGlow` | ui | Pointer-reactive card whose mesh-gradient border lights up the edge nearest the cursor. |
+| `Carousel` | ui | Motion-powered, draggable 3D card carousel with autoplay, looping, and an optional round layout. |
+| `CardSwap` | ui | Animated 3D stack of cards that cycles the front card to the back on a timer; uses `gsap`. |
+| `TargetCursor` | ui | Custom cursor that replaces the pointer with a spinning reticle snapping to marked targets; uses `gsap`. |
+
+### Feature blueprints
+
+| Entry | Category | What it bundles |
+| --- | --- | --- |
+| `ai-chat` | ai-feature | A typed chat hook plus a streaming edge function — a full "add AI chat" feature. |
+| `pdf-compressor` | file-feature | Client-side utils, a hook, and a component — PDF compression with no edge function. |
+
+<Tip>
+  The animated React Bits entries (`BorderGlow`, `Carousel`, `CardSwap`, `TargetCursor`,
+  `Strands`) are adapted to the repo's conventions: raw stylesheets are dropped for Tailwind
+  and shadcn design tokens where possible, hard-coded colours become theme tokens, and each is
+  a client component. Effects that Tailwind can't express (BorderGlow's `mask-composite` and
+  blend layers) keep a co-located stylesheet.
+</Tip>
+
+## Reviewing the catalog
+
+Two admin pages back the registry. `/admin/registry` shows status (entry count, manifest
+version, whether the bucket is configured), per-entry usage counts, recent install activity, a
+cache-clear button, and a search panel that runs the exact backend behind
+`query_registry_components` so you can debug why an entry did or didn't surface.
+`/admin/registry/preview` renders each entry live from its S3 source, with a graceful
+"source unavailable" fallback, so you can review what a component actually looks like before
+the agents reach for it.

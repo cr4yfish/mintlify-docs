@@ -1,0 +1,154 @@
+---
+title: "Billing & credits"
+description: "How Genie meters usage in credits, resolves plans, and bills teams through Stripe."
+---
+
+Genie meters every AI generation in **credits**. You get a monthly allowance from your plan, you can top it up, and — on team workspaces — you share one pooled balance across everyone. This page explains how credits are consumed, how plans resolve, how team billing works through Stripe, and how the workspace chat agent can answer billing questions for you.
+
+## The credit model
+
+A credit is the unit Genie deducts when you run a generation. Each chat turn drains credits from a **wallet**:
+
+- **Personal wallet** — your own balance, funded by your personal Genie plan.
+- **Workspace wallet** — a shared balance owned by a workspace on a paid Teams plan.
+
+Which wallet pays is decided by the project you are working in. A project inside a workspace with an active Teams subscription spends the **workspace wallet**; a project in a personal or unpaid workspace spends **your personal wallet**. The two never draw on the same balance, so being both a personal subscriber and a team seat never double-charges you for one turn.
+
+### How credits are consumed
+
+Credits live in dated **batches**. When you run a turn, Genie drains batches **oldest-expiry-first (FIFO)** and skips any that have expired. The amount charged reflects real token usage for that turn, converted to credits — never a client-side estimate.
+
+Admins can see exactly what a single message cost. A subtle **credits label** appears under each assistant message showing that message's net cost (usage minus any refunds). The label only appears once the turn has settled, so the number is always the authoritative ledger total rather than a mid-stream guess.
+
+<Info>
+"Credits used" always means net out-of-pocket spend: usage minus refunds. Grants and top-ups are excluded from usage totals.
+</Info>
+
+## Plans and effective-plan resolution
+
+Personal plans run from **Starter** (free) up through **Genie**, **Genie plus**, **Genie pro**, and **Genie ultra**. Each paid tier grants a fixed monthly credit allowance; Starter is limited by a daily cap instead of a monthly pool.
+
+When a paid subscription is canceled, Stripe keeps the last paid tier on record — it does not reset you to Starter. Genie therefore **derives** your current tier rather than reading the stored one:
+
+- A plan is **lapsed** when its subscription is canceled, or when its cancel date has already passed.
+- A subscription set to cancel at period end is **not** lapsed yet — you keep paid access until the period ends.
+- A lapsed plan resolves to **Starter** everywhere: your profile, your credit grants, the spend path, and the pricing page all agree.
+
+This single source of truth prevents the classic canceled-plan bugs where the profile said "Starter" but the pricing page said "already on Genie pro" and blocked you from re-subscribing.
+
+## Credit rollover
+
+By default, unused monthly credits can **roll over** into later billing cycles instead of expiring at renewal. Each plan sets how many extra cycles its credits survive:
+
+- A rollover window of `0` means credits expire at the end of their own cycle (legacy behavior).
+- A window of `N` means credits stay usable for `N` extra cycles.
+
+Paid Genie tiers currently roll over for one extra cycle; Starter and unlimited do not. Because expiry is time-based and drained FIFO, rolled-over credits are always spent before they lapse, and balances self-cap at roughly `N + 1` cycles — there is no unbounded accumulation.
+
+Top-ups are unaffected: they keep their own fixed one-year expiry.
+
+<Note>
+Changing plans voids active subscription credits (including rolled-over ones) before granting the new plan's credits. Rollover does not change the upgrade policy.
+</Note>
+
+## Team billing via Stripe
+
+A **Teams** subscription belongs to a workspace instead of a person. Every active member fills a billable **seat**, and credits and limits live on the workspace wallet.
+
+### How a Teams subscription is priced
+
+Each Teams tier bills as **two Stripe prices on one subscription**:
+
+| Price | Pays for | Quantity |
+| --- | --- | --- |
+| **Base** | The workspace itself (shared cloud, central billing, access control) | Always 1 |
+| **Seat** | Each active member | The purchased seat count |
+
+Credits are granted on the **seat** price only — the flat base fee buys the workspace, not credits. Your monthly workspace allowance is the per-seat credit amount multiplied by the number of seats you bought.
+
+### Getting a Teams plan
+
+An **owner** or **admin** starts checkout from the pricing page or the workspace billing tab. There are two entry points:
+
+<Steps>
+  <Step title="Upgrade an existing workspace">
+    Pick a Teams tier, interval, and seat count. Genie validates that you are an owner or admin and that you are not buying fewer seats than you already have filled.
+  </Step>
+  <Step title="Buy and get a workspace">
+    Start Teams checkout without picking a workspace. Genie creates a fresh workspace, adds you as its owner, then runs the same checkout.
+  </Step>
+  <Step title="Complete Stripe Checkout">
+    Stripe combines the base and seat line items onto one subscription. When payment confirms, the webhook records your subscription, flips the workspace to the paid tier, and grants credits on the first paid invoice.
+  </Step>
+</Steps>
+
+Once the subscription is active, a **Genie Cloud** (Supabase) project is provisioned for the workspace automatically — no extra Stripe setup required.
+
+### Seats
+
+Seats are **purchased capacity**, not a live head count. The rules:
+
+- The active member count can never exceed the purchased seats. Accepting an invite past the cap is hard-blocked.
+- Members joining or leaving never changes your Stripe bill on their own — a freed seat stays paid-for until an admin lowers the seat count.
+- Adding or removing seats is an explicit admin action that updates the seat quantity in Stripe with proration.
+
+The billing tab shows "X / Y seats filled" so admins never send invites they cannot fulfil. A nightly watchdog alerts (but never auto-corrects) if the active count ever exceeds the purchased seats.
+
+### Plan changes and top-ups
+
+Re-running checkout against an active workspace with a different tier, interval, or seat count updates the Stripe subscription with proration, then grants the new plan's credits. Re-running with the **same** details instead opens the Stripe customer portal so you can manage your payment method.
+
+Admins can also buy **top-ups** — extra credits that land in the workspace wallet and expire one year out.
+
+### Operator setup
+
+Turning on Teams billing is a one-time Stripe configuration: create one product per tier, add base and seat prices for both billing intervals (16 prices in total), subscribe the existing webhook to the standard subscription and invoice events, and configure a scoped customer portal that allows cancellation and payment-method updates but **not** in-portal plan switches (those must go through the app so seat caps and credit math stay correct). See the internal `team-billing-stripe-setup.md` runbook for the full checklist.
+
+## The workspace credits card
+
+On a project that belongs to a **paid workspace**, the usage card shows the **shared workspace wallet's** balance rather than your personal plan — because that is what the next generation actually spends. The card displays a **Workspace** badge, the Teams plan name, and the live spendable balance.
+
+The balance shown is the **live drainable balance**: the sum of active, unexpired, plan-matching batches the spend path can actually drain, not a cached column that might drift high. Reading the same live balance everywhere fixed a bug where the chat wrongly reported "out of credits" while the billing page still showed a positive balance.
+
+On a personal-tier project (no workspace, or an unpaid workspace), the card is unchanged: it shows your personal plan and wallet.
+
+## The workspace billing page
+
+Every workspace owner can open the billing page, free or paid:
+
+- **Free workspaces** (no active or trialing subscription) see an **upgrade advertisement** that links to the pricing page, plus a Genie AI button with a pre-filled prompt asking Genie to recommend a plan. Free workspaces have no shared wallet, so no consumption analytics are shown.
+- **Paid workspaces** see the full dashboard: billing overview, seat count, and consumption analytics.
+
+When a user is the only member of a workspace, the dashboard's activity feed is replaced with a **plan & credits panel**. For a free workspace it shows your personal plan; for a paid workspace it shows the workspace plan and shared credits, with an "Ask Genie about my plan" button pre-filled with your current tier and remaining credits.
+
+## Out-of-credits handling
+
+Before each chat turn, Genie runs a pre-flight credit check against the **live** drainable balance. If you are out of credits, the turn is rejected and the assistant renders an out-of-credits card.
+
+That card polls your allowance. The moment credits return — a top-up, a plan grant, or a daily reset — it flips to a "credits restored" state with a **Resend message** button that re-sends your rejected prompt directly through the chat runtime, with no page reload. The button locks after one click so a double-click cannot double-send.
+
+<Tip>
+For team members who hit the wall, the message points to your workspace admin (who can add seats or buy top-ups) rather than to the personal pricing page.
+</Tip>
+
+## The pricing page
+
+The `/pricing` page walks a visitor through their decision journey: hero, pick a plan, compare what each plan includes, add top-up credits, browse onboarding and support add-ons, read the FAQ, and a final call to action. Copy is fully localized.
+
+## The chat agent's billing tools
+
+The workspace chat agent (Genie AI) can read billing data on your behalf through two read-only tools, so you never have to leave chat to answer a billing question.
+
+### Credit usage
+
+`get_credit_usage` answers spend questions like "how many credits did I burn this month?" or "which project is eating credits?" straight from the ledger. It returns a net total (usage minus refunds) and can break usage down by project, user, or day over a chosen range.
+
+Visibility is role-gated: any member can query their own usage (`scope: "me"`), but reading workspace-wide totals or a per-user breakdown requires **owner** or **admin**. When you are not eligible, the agent explains the limit and offers to re-run the query for just your own usage.
+
+### Pricing
+
+`get_genie_pricing` answers any catalogue question — "what does Genie pro cost?", "how much per seat for Teams?", "price of the 750-credit top-up?" — with current numbers. It pulls live prices from Stripe and combines them with the same plan limits, credits, and marketing copy the pricing page renders, so the figures never drift out of sync. If Stripe is unreachable, it falls back to the page's headline labels and flags the numbers as approximate.
+
+<Note>
+`get_genie_pricing` is the price catalogue. To ask about your own subscription, seats, or renewal date, the agent uses the separate `get_workspace_billing` tool.
+</Note>

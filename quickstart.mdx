@@ -1,47 +1,62 @@
 ---
 title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+description: "Go from a prompt to a deployed app in Genie in a few minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This quickstart takes you from an empty workspace to a live app. You only need a
+Genie account and an idea to describe.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, you need:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- A Genie account (sign up at [genie-app.de](https://www.genie-app.de)).
+- A modern browser — no local install required. Genie builds and deploys in the
+  cloud.
 
 ## Get started
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
-
-    ```bash
-    npm install your-package
-    ```
+  <Step title="Finish onboarding">
+    On first sign-in, a short guided flow collects your name, account type, and
+    role, then turns a personalized welcome prompt into your first project and
+    build. See [Workspace → Onboarding](/features/workspace#onboarding).
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
-
-    ```bash
-    your-cli init
-    ```
+  <Step title="Describe your app">
+    From the workspace dashboard, type what you want to build into the prompt
+    input — for example, *"a project tracker with a kanban board and a stats
+    dashboard."* Quick actions offer starting points if you're not sure where to
+    begin.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
-
-    ```bash
-    your-cli start
-    ```
+  <Step title="Review the plan">
+    Genie proposes a plan before writing any code. Read it, request changes, or
+    approve it. Approving starts the build. See
+    [Building apps → Planning](/features/building-apps).
+  </Step>
+  <Step title="Watch it build and deploy">
+    The build pipeline shows live step progress. A scoped coding agent writes the
+    code, Genie provisions a [Genie Cloud](/features/genie-cloud) backend
+    (database, storage, auth) as needed, and deploys a live preview.
+  </Step>
+  <Step title="Iterate with Genie AI">
+    Open [Genie AI chat](/features/genie-chat) and keep refining — ask for
+    changes, new pages, or backend tweaks. Genie AI can read and edit everything
+    in your workspace on your behalf.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Connect over MCP
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Genie exposes its own [MCP server](/features/mcp-and-tools) so external AI
+clients (Claude Desktop, Cursor, custom agents) can manage your workspaces and
+projects programmatically. Authorize a workspace over OAuth and point your
+client at:
+
+```
+https://www.genie-app.de/api/mcp
+```
+
+<Tip>
+  Stuck or found a docs gap? Genie's internal agents read these pages over MCP —
+  keep them accurate by documenting each new feature here as it ships.
 </Tip>

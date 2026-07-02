@@ -1,0 +1,243 @@
+---
+title: "LLM proxy and models"
+description: "How Genie routes model calls, maintains its model catalog, and lets admins assign models per agent."
+---
+
+Genie never hardcodes a raw provider endpoint at a call site. Every model call
+flows through a routing layer that maps a short model key to a concrete provider
+model and picks the right transport, and admins can repoint any of it — per
+agent, per audience — from the admin UI without a redeploy. This page covers
+that internal routing, the model catalog behind it, the admin configuration
+surface, provider/transport overrides, and how runs are traced.
+
+The page also covers the separate **Genie Cloud provider proxy** — the
+forwarding proxy that lets apps *built with Genie* reach OpenAI, Resend, and
+Hugging Face using Genie-held keys. The two systems are unrelated in code but
+share the "LLM proxy" name, so both live here.
+
+<Note>
+  This is an internal platform feature. The routing layer, admin config, and
+  provider proxy are all admin- or operator-facing; end users never touch them
+  directly.
+</Note>
+
+## Internal model routing
+
+`resolveModel` (`src/lib/chat/server/prepare-chat.ts`) is the single front door
+for every agent's model call. It takes a short **key** (`sonnet`, `haiku`,
+`gpt`, …), looks it up in the catalog, and returns a fully configured model
+handle: the concrete provider model id, the transport to reach it, and any
+family-specific settings (thinking budget, reasoning effort, beta headers).
+
+Since June 2026 the contract is simple: **a key routes to the model its name
+says.** Earlier, `gpt`, `gptmini`, and `gptnano` all silently resolved to
+GPT-5.5, which made model choice at call sites misleading.
+
+### The model catalog
+
+The catalog maps each key to a provider and a concrete model id:
+
+| Key | Provider | Model | Intended use |
+| --- | --- | --- | --- |
+| `sonnet` | Anthropic | `claude-sonnet-5` (direct/Vertex) · `claude-sonnet-4-7` (Bedrock) | First-prompt build loop, UI-design steps. Adaptive thinking only. |
+| `haiku` | Anthropic | `claude-haiku-4-5` | Follow-up/chat turns, tech-lead planner. Fallback for unknown keys. |
+| `opus` | Anthropic | `claude-opus-4-8` | Admin/special. |
+| `mistral` | Mistral | `mistral-small-latest` | Misc cheap text. |
+| `gpt` | OpenAI | `gpt-5.5-2026-04-23` | GPT-5.5 workhorse. |
+| `gptmini` | OpenAI | `gpt-5.5-2026-04-23` | Legacy alias of `gpt` — not a "mini" tier. |
+| `gptnano` | OpenAI | `gpt-5-nano-2025-08-07` | Nano tier: classifiers, scorers, prompt-gen. |
+| `codex` | OpenAI | `gpt-5.3-codex` | Code-specialised tasks. |
+| `kimi` | OpenRouter | `moonshotai/kimi-k2.7-code` | Swappable tech-lead planner option. |
+
+A few things the catalog encodes beyond the id:
+
+- **Sonnet thinking is adaptive-only.** Claude Sonnet 5 (like Opus 4.8) removed
+  manual extended thinking — sending `thinking: { type: "enabled", budget_tokens }`
+  now returns a 400. `resolveModel` always emits `thinking: { type: "adaptive" }`
+  for `sonnet` and `opus`; only a forced-`toolChoice` turn disables it. Haiku 4.5
+  still uses budgeted thinking.
+- **`reasoningEffort`** is forwarded for the `gpt-5.5*` and `gpt-5-nano*` models;
+  `codex` runs on its own defaults.
+- **`sonnet` is transport-split.** Sonnet 5 is not on Bedrock yet, so the AWS
+  transport derives `eu.anthropic.claude-sonnet-4-7` while the direct API and
+  Vertex use `claude-sonnet-5`. This derivation happens inside `resolveModel` —
+  it is not a catalog repoint.
+
+Every `resolveModel` call logs `Resolved model <model> for request <key> with
+provider <provider> (transport=…)`, so you can confirm the mapping in the server
+logs after any turn.
+
+### Provider transports and failover
+
+Anthropic keys additionally resolve a **transport** — the concrete API used to
+reach Claude:
+
+- **Direct Anthropic API** — the default.
+- **Amazon Bedrock** — the EU-resident path used for paid (Teams) workspaces,
+  plus per-call failover.
+- **Google Vertex** — an alternative EU-resident transport.
+
+Which one is used is decided per call by three inputs, in order: a per-call
+`providerOverride` (e.g. the scoped-code-agent retry failover), the
+paid-workspace transport (`resolveClaudeProviderForProject`), and the
+deployment-level `LLM_PROVIDER` default. OpenAI, Mistral, and OpenRouter keys are
+transport-invariant — their ids mean the same thing everywhere.
+
+`kimi` reaches OpenRouter through `@ai-sdk/openai-compatible`
+(`OPENROUTER_API_KEY`, base URL `https://openrouter.ai/api/v1`). It does **not**
+use the EU-resident Claude transport.
+
+## Admin LLM model configuration
+
+Admins choose **which concrete model every agent runs on, per audience tier**,
+entirely from the admin UI and **without a redeploy**. This replaces hardcoded
+`modelRequest` values at each call site with a DB-backed assignment matrix plus a
+cached resolver.
+
+- **Admin UI:** `/[lang]/admin/llm-models`
+- **Test harness:** `/[lang]/test/llm-model-config` (pure preview of every UI state)
+- **Resolver:** `resolveModelForAgent` (`src/lib/chat/server/llm-model-resolver.ts`)
+
+### Per-agent, per-audience assignment
+
+The matrix (`llm_agent_model`) has one row per agent and four audience columns:
+
+- **Free users** — free/Starter plan, no active paid subscription.
+- **Paid users** — active individual paid subscription.
+- **Paid workspaces** — Teams workspaces (the EU-resident transport tier).
+- **Admins (override)** — wins over all others, but only while the admin-override
+  flag is on.
+
+Precedence when resolving an audience is `admin > paid_workspace > paid_user >
+free`. A cell left on **"Default (code)"** keeps the agent's built-in default, so
+an empty matrix reproduces today's behaviour exactly. The `admin_override_enabled`
+flag lets you A/B a model on yourself before rolling it out.
+
+<Note>
+  Every admin action is gated server-side (`checkIfUserIsAdmin`) and validated
+  against the canonical agent/audience/model lists. Per repo convention the page
+  has a **Copy debug JSON** button that exports the full config plus a resolution
+  preview for every cell.
+</Note>
+
+### Custom models and custom-key routing
+
+The **Add model** button adds a row to the catalog (`llm_model`). You can either
+start from a built-in preset (prefilled from `DEFAULT_MODEL_META`) or add **any
+custom model**: a new lowercase-slug key (`[a-z0-9_-]`, 2–50 chars, unique), one
+of the four supported providers (`anthropic` / `openai` / `mistral` /
+`openrouter`), and a concrete model id.
+
+When the picked key is a custom one, `resolveModel` has no built-in id/provider
+for it, so the resolver passes the catalog row's `modelId` and `provider` and
+`resolveModel` builds an ad-hoc entry and routes it to the matching transport.
+Family-specific config (thinking/reasoning) only attaches to the built-in
+Claude/GPT ids it was written for, so a custom model runs on provider defaults.
+
+### No redeploy, and parity on merge
+
+- **No redeploy:** any write (catalog edit, assignment, flag) invalidates the
+  in-process cache on the serving instance immediately, and a 30s TTL bounds
+  staleness on every other instance — so a change is live fleet-wide within ~30s.
+- **Parity:** a concrete `modelIdOverride` is emitted **only** when an admin has
+  repointed a key away from its code default. In the freshly-merged state — empty
+  matrix, unedited catalog, override off — every call resolves byte-identically to
+  before, including the derived Bedrock/Vertex ids.
+
+<Warning>
+  A repointed **Anthropic** id is applied verbatim, so under Bedrock/Vertex an
+  operator must supply a transport-appropriate id (or repoint only on the direct
+  API). OpenAI / Mistral / OpenRouter ids are transport-invariant and always safe
+  to repoint.
+</Warning>
+
+## Model override environment variables
+
+Two operator switches sit alongside the DB config:
+
+- **`BEDROCK_MODEL_OVERRIDE`** — a kill-switch for the Bedrock/Vertex transports.
+  Only the literal string `off` disables them, forcing **every** Claude request
+  onto the direct Anthropic API (per-call `providerOverride`, the paid-workspace
+  transport, and `LLM_PROVIDER` are all bypassed). `on`, empty, or unset preserves
+  normal routing. It affects Claude traffic only.
+- **`TECH_LEAD_MODEL`** — a hard override for the tech-lead planner. When set to a
+  recognized value (`sonnet`, `haiku`, `gptmini`/`gpt`, `kimi`) it forces that
+  model for every tech-lead run, regardless of task scale; unset or unrecognized
+  falls back to the scale default (Sonnet for large tasks, Haiku for SUM-classified
+  small tasks). Note that `gptmini` and `kimi` route to OpenAI/OpenRouter and so
+  do **not** use the EU-resident Claude transport.
+
+## The Genie Cloud provider proxy
+
+Apps built with Genie run in the user's own Supabase project; their AI features,
+contact forms, and ML inference live in edge functions that need provider API
+keys. Rather than ask every new user to register at three SaaS providers, Genie
+runs a thin HTTP forwarding proxy on `cloud.genie-app.de` that swaps in
+Genie-held keys.
+
+The flow: a user edge function calls the proxy with a **per-user bearer token**
+(`gnp_*`, seeded into their vault as `OPENAI_API_KEY` / `RESEND_API_KEY` /
+`HF_TOKEN`). The proxy validates the token (DynamoDB), resolves the upstream key
+(Secrets Manager), forwards the request with the real key swapped in, streams the
+response back unchanged, and logs one usage row.
+
+Key properties:
+
+- **Per-user tokens** are stored as sha256 hashes, never cleartext; the raw token
+  is returned exactly once at provision time and only ever lives in the user's own
+  vault.
+- **Usage logging** writes one fire-and-forget `GenieProxyUsage` row per call
+  (owner, provider, path, status, latency, prompt tokens where available). Bodies
+  are never logged.
+- **Guardrails per provider:** an OpenAI model allowlist (default
+  `gpt-5-nano-2025-08-07`, rejects others with 400), a Resend verified-sender-domain
+  check (`email.genie-app.de`, else 422), and a per-cloud fixed-window rate limit
+  (default 60 rpm, fail-open).
+- **Override path:** a power user can paste their own `sk-...` / `re_...` / `hf_...`
+  key, which auto-flips the matching base URL back to the provider's host and takes
+  the proxy (and its allowlists/limits) out of the request path entirely.
+
+### Provider status
+
+Support is uneven across the three upstreams:
+
+- **Resend** — feature-complete.
+- **OpenAI** — shipping: proxy route, streaming pass-through, proxy-enforced model
+  allowlist, prompt-token logging, and per-cloud rate limiting. Open gaps include
+  completion-token billing (needs an SSE tee) and image/audio route pricing.
+- **Hugging Face** — mostly working, but with sharper edges: the SDK needs a custom
+  `fetch` wrapper to reach the proxy, `router.huggingface.co` models are **not yet
+  supported** (they bypass the proxy and 401), and cold-start 503s are expected on
+  free-tier inference.
+
+## Observability with Braintrust and OTel
+
+There is **no** Braintrust logger, `wrapAISDK`, or `wrapTraced` in the codebase.
+Spans reach Braintrust through exactly one path: an AI SDK call passes
+`experimental_telemetry`, and the OTEL exporter in `src/instrumentation.ts`
+(`BraintrustExporter`, `filterAISpans: true`) ships the resulting AI spans. A call
+that omits `experimental_telemetry` is simply invisible.
+
+`isBraintrustTelemetryEnabled(claudeProviderOverride)` in `src/lib/ai/telemetry.ts`
+is the single gate:
+
+- **Free / per-user projects** → telemetry **on**.
+- **Paid (Teams) workspaces** → telemetry **off** — they route Claude through an
+  EU-resident provider, and their prompts/completions must not leave for Braintrust.
+
+**`BRAINTRUST_OTEL_OVERRIDE=on`** force-enables telemetry everywhere, paid
+workspaces included — useful when debugging a paid-workspace issue. Only the
+literal `on` activates it; anything else keeps the default gating.
+
+Two refinements are worth knowing:
+
+- **Parallel batch coding** threads a distinct telemetry identity per step
+  (`functionId` → span name `scoped-code-agent.step-N`, plus `stepIndex` /
+  `stepLabel` / `batchRunId` metadata) so concurrent runs don't collapse into one
+  indistinguishable trace.
+- **The durable scoped agent** regressed to emitting nothing when it moved to the
+  durable workflow path (it never passed `experimental_telemetry`). The fix threads
+  the already-built telemetry config through to `DurableAgent.stream`. Verify it on
+  the admin harness at `/test/scoped-code-workflow` — the **Check Braintrust
+  telemetry** button shows the exact config the run will attach, including the
+  bottom-line `willEmitSpans`.

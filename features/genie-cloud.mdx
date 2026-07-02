@@ -1,0 +1,126 @@
+---
+title: "Genie Cloud — backend"
+description: "The managed backend Genie provisions for every app: a Postgres database, row-level security, storage, edge functions, and scheduled jobs."
+---
+
+Genie Cloud is the managed backend that Genie provisions for each app you build. Every app gets its own Postgres database (reached through the AWS Data API), row-level security for tenant isolation, object storage, edge functions, and scheduled jobs. You never wire this infrastructure by hand — Genie's agents provision it, evolve the schema, deploy functions, and schedule work on your behalf, and the Workspace Chat Agent (Genie AI) can read and edit all of it for you.
+
+## Provisioning and recovery
+
+A project that qualifies for Genie Cloud (a paid plan whose owner already has a provisioned instance) is auto-provisioned no matter how you create it. All three creation routes — the workspace dashboard prompt, the workspace chat agent, and the Genie MCP `create_project` tool — call one shared gate, `autoProvisionGenieCloudForNewProject`. The gate is shallow-link only: it links the new project to the owner's existing instance and kicks the `provisionGenieCloud` workflow with a bounded retry. It never throws, so a creation flow can read its result without a `try`/`catch`.
+
+When synchronous setup fails, the project page mounts a recovery banner. The banner does not trust the failure flag blindly — on mount it reads the authoritative state and renders the matching explicit UI state:
+
+- **Loading** — checking the real state, never guessing a value.
+- **Active / not applicable** — nothing to recover; the banner removes itself.
+- **Provisioning** — still setting up, with a manual retry in case the workflow stalled.
+- **Missing** — a prominent error plus a **Retry provisioning** button.
+- **Fetch error** — couldn't read the state; error plus **Check again**.
+
+Retries re-run the idempotent gate and are hard-capped. To exercise the flow yourself, open `/test/genie-cloud-provisioning` for a gallery of every banner state, or append `?gcProvisioningFallback=true` to any `/project/<id>` URL you own.
+
+## The database (Postgres over the AWS Data API)
+
+Your app's database is Aurora Serverless v2 Postgres, reached over the RDS Data API rather than a pooled connection. That driver has two hard constraints that shape every query the platform writes.
+
+<Warning>
+  **The AWS Data API binds every parameter as text and enforces a ~1 MB limit per request.**
+
+  - **No implicit casts.** Postgres will not auto-cast text to a typed column, so `uuid_column = 'value'` raises `operator does not exist: uuid = text`. Always cast explicitly in app-layer queries — `${workspaceId}::uuid`, `${count}::int`.
+  - **~1 MB per request and result set** (plus a cap on parameters per statement). Never `SELECT` an unbounded result set, build a giant `IN (...)` or bulk insert, or pile thousands of rows into one transaction. Process large jobs in bounded chunks (for example, batches of ~100), commit each chunk separately, and cap the total with a hard loop limit.
+</Warning>
+
+### Serial transactions
+
+A Data API transaction runs **one statement at a time**. It is keyed by a single `transactionId`, and issuing a second statement before the previous one returns fails with `Transaction is still running a query`. Inside a `transaction()` callback, `await` every statement one at a time — never wrap multiple `tx.execute` calls in `Promise.all`. (`Promise.all` is still fine for independent top-level calls that each open their own transaction.)
+
+Also never `await` slow non-DB work (an LLM call, an S3 fetch) between statements inside a transaction: the Data API terminates a transaction after ~3 minutes of idleness on its id, so the next statement throws. Resolve that work before opening the transaction and pass the result in.
+
+### Schema changes through the database agent
+
+The `execute_sql_agent` subagent owns schema evolution. It exposes `create_table`, `add_column`, `alter_column_type`, `alter_column_default`, indexes, RLS/policy DDL, and DML — so it never routes you to a dashboard to run SQL by hand. A few behaviors worth knowing:
+
+- **`alter_column_type`** always emits a `USING` clause (Postgres has no implicit cross-type cast); it defaults to `"col"::newType` and accepts an explicit conversion expression for messy data.
+- **`alter_column_default`** preserves function-call defaults verbatim (`now()`, `gen_random_uuid()`), unlike the create-time resolver that whitelists only those two.
+- **`add_column`** honors `DEFAULT`, `UNIQUE`, and `REFERENCES`, so you can add a `NOT NULL` column to a populated table with a backfilling default.
+- Every write op runs through identifier validation (`^[a-zA-Z_][a-zA-Z0-9_]*$`), a type allow-list, a token guard that rejects `;`, `--`, and `/*`, and a transaction wrapper that rolls back cleanly on failure.
+
+### Error logging and transient retries
+
+Failures are logged server-side with full context — action, table, the exact SQL, the PostgreSQL `code`/`detail`/`hint`, and the connection host with the password redacted. Known-transient errors (`40P01` deadlock, `40001` serialization failure, `55P03` lock not available, `55006` object in use) return an explicit "retry the same call once" instruction instead of an unhelpful default hint.
+
+A Supabase project lives behind one of two regional pooler hosts, so the platform probes both in order. A miss on the first host logs a single quiet warning and moves on; only the terminal failure (last host also failed) produces the full error dump — so a project that resolves on the second host no longer logs a scary false failure on every migration.
+
+### Local testing
+
+Production is Aurora over the Data API, which can't be exercised locally, so integration tests run plain Postgres 16 (with `pgvector`) in Docker and connect with `postgres-js`. The SQL — every RLS policy included — is identical; only the driver differs. Tests connect as a non-superuser role (`genie_test`) without `BYPASSRLS` so `FORCE ROW LEVEL SECURITY` is genuinely enforced. Note that local `postgres-js` does full type coercion, so a missing `::uuid` cast passes locally and only fails against Aurora — type-cast bugs are caught by the staging tests.
+
+## Row-level security and tenant isolation
+
+RLS is the **primary** authorization boundary — app-layer `WHERE owner = …` filters are defense-in-depth, not authorization. The worst-case fallout of an app bug is "no rows returned," not "rows from the wrong tenant."
+
+Every Genie Cloud database is multi-tenant, and isolation is enforced automatically. A bootstrap event trigger (`rls_auto_enforce_isolation`) fires on every `CREATE TABLE` in the `public` schema and appends a `sub_project_id UUID` column defaulting to `get_sub_project_id()`, enables RLS, and adds a catch-all `auto_tenant_isolation` policy (`FOR ALL USING (sub_project_id = get_sub_project_id())`). The database owns this column: the agent's `create_table` / `add_column` / `alter_column_*` tools strip or refuse any agent-supplied `sub_project_id` so it can never collide with or override the managed one.
+
+The auto policy covers all four commands at tenant scope, but it is not owner-scoped and disappears if an agent replaces it, so it is not a substitute for intentional per-command policies. Two backstops keep coverage honest:
+
+- **Static coverage analysis** (`analyzeRlsCoverage`) inspects the policies created during a run and appends an `⚠️ RLS coverage warnings` block whenever a table has RLS enabled but only some CRUD commands covered (the classic case: SELECT + INSERT + UPDATE with DELETE forgotten, so the delete button silently does nothing). It fires deterministically even when the model's prose claims success.
+- **Delete/update verification.** `delete_row` / `update_row` build SQL with `RETURNING *`; a mutation that matched **zero rows** appends a prominent notice telling the agent to investigate (a wrong `WHERE` or a missing policy), not report success. Generated app code mirrors this: it chains `.select()` on every `.delete()`/`.update()` and treats an empty returned array as a failure.
+
+In production, every DB call goes through the `transaction()` wrapper, which sets `app.current_user_id` and `app.bypass_rls` GUCs that the policies read via `current_setting(...)`. Service work (cron, webhooks) uses `skipAuthCheck: true` to bypass RLS explicitly rather than relying on a connecting role's flag.
+
+### Re-running migrations
+
+The global setup script is idempotent (`CREATE OR REPLACE` / `IF NOT EXISTS` / `ON CONFLICT`), so a platform admin can push global-script updates onto an already-provisioned instance without re-provisioning. The admin user-detail page has a **Re-run migration** button (with a "Copy migration JSON" debug export) that runs `globalSetupScript` against a single user's cloud — the supported way to roll out shared functions like `sync_user_profile` to existing user-level clouds.
+
+## Storage
+
+Storage uses two reserved buckets: `public-assets` (public) and `private-storage` (private). Paths passed to `.upload(...)` are **project-relative** — the runtime deterministically prefixes the project id, and the storage RLS policies require the first path segment to equal the sub-project id, so you never prepend the project id or bucket name yourself.
+
+Before emitting any literal upload path, the storage agent decides whether files are per-user or app-wide and inspects the real bucket layout:
+
+- **Per-user** — `user-profiles/<auth.uid()>/<file>` (public) or `user-files/<auth.uid()>/<file>` (private).
+- **App-wide** — `app-content/<file>` for shared logos, marketing images, and brand assets.
+
+A content validator flags path defects on every file write: unknown buckets, writes to a bucket root (which has no RLS policies), a hardcoded second segment where a `${uid}` binding belongs, client code touching private assets, `getPublicUrl` on a private bucket, and hand-assembled `storage/v1/object/...` URLs that skip the tenant-aware client (those 404 because they miss the project prefix).
+
+### Upload progress
+
+`supabase.storage.from(...).upload()` is built on Fetch, which exposes no upload-progress events — so it can never drive a progress bar, and the agents must not fake one with a timer. Instead, the template ships `uploadWithProgress`, which signs a one-shot upload URL and `PUT`s the file with `XMLHttpRequest` so `onProgress` fires; it supports `AbortSignal` cancellation and enforces a hard size ceiling. A ready-made hook and UI ship as the `file-upload-progress` registry component, installed with `add_registry_entry`.
+
+## Edge functions
+
+Edge functions are Deno functions deployed to your Supabase project and invoked with `supabase.functions.invoke(...)`. The `edge_functions_agent` deploys them and mirrors each function's source into your app's S3 project at `supabase/functions/<slug>/index.ts` for discovery.
+
+### JWT authentication
+
+Gateway-level `verify_jwt` is legacy and unused; auth is enforced **in the function code** via one canonical, audited guard. Set `requireAuth: true` and the agent injects the `@genie-auth-guard` guard, which verifies the caller's bearer token with `auth.getUser()` using the auto-provided `SUPABASE_URL` / `SUPABASE_ANON_KEY` — there's no user secret to configure. A deterministic deploy gate rejects the function unless the guard marker is present, `requireUser(req)` is actually invoked, and its 401 path is wired with an `instanceof Response` early return. Auth is decided per function (no global kill switch — that would be a footgun); the `/admin/auth-guards` console tracks guarded functions and sweeps stale ones up to the latest guard version with real redeploys.
+
+### Background processing
+
+For non-streaming work that can take more than a couple of seconds — AI analysis, multi-step pipelines, slow third-party APIs — the naive shape of awaiting the job inside the request times out at the gateway. Genie generates a **job-table** pattern instead: a `<feature>_jobs` table is the source of truth; the function validates input, inserts a `processing` row, returns `{ jobId }` immediately (HTTP 202), runs the heavy work in the background with `EdgeRuntime.waitUntil(...)` under a built-in timeout, and writes the result back onto the row. The frontend polls the row by id and renders every state (idle, processing, done, error + retry). Nothing long-running rides the request connection, so nothing times out. Don't store large blobs on the job row — use a bucket and reference the path (edge requests cap at ~6 MB).
+
+### Source mirror and column validation
+
+Two reliability guards back deploys:
+
+- **Source mirror.** The mirror write is awaited and retried with bounded backoff, and a genuine failure surfaces as a visible warning in the agent's reply (it once failed silently, leaving `edge_function_missing` reconciliation errors). The mirror is keyed by project **slug**, matching every reader.
+- **Column validation.** Before writing any `.from(...)` query the agent calls `validate_table_name` to get the table's real columns, and a deterministic deploy gate blocks a function that references a provably-absent column — listing the offending refs and the columns the table actually has. The check is conservative and fail-open: it skips dynamic table/column names, unknown tables, and PostgREST embedding syntax, so it never wedges a legitimate deploy.
+
+The Genie Cloud subagents (`execute_sql_agent`, `edge_functions_agent`, `storage_agent`, `schedule_agent`) run under a stall watchdog that arms immediately and pauses while a tool is in flight, so a hung provider request throws an explanatory error instead of returning `null` — a subagent tool result is never empty.
+
+## Scheduled jobs (cron)
+
+A scheduled job runs a **deployed edge function on a timer** — and only an edge function. Its sole in-database action is `net.http_post(<function url>)`, so it touches no tenant data in the database role context; all data work happens inside the function under its `safe_client` scope, which is already tenant-isolated. That deliberately deletes the entire RLS-bypass surface that scheduling raw SQL would require.
+
+The bootstrap enables `pg_cron` and `pg_net` plus `SECURITY DEFINER` catalog wrappers, so the agent-reachable surface is prefix-scoped by construction: jobs are stored as `p_<projectId>_<jobName>`, and list/unschedule only ever see that project's prefix. You declare a job as a `schedule` task (`function_slug`, `cron`, optional `timezone` and `job_name`), and a deterministic `schedule_agent` — no LLM loop — calls the shared `cron-jobs.ts` primitive. Schedule tasks run last (after the function is deployed) so a cron never targets a phantom slug. The primitive validates the cron expression, rejects sub-minute cadence, converts an IANA timezone to the correct UTC expression (pg_cron fires in UTC), and is idempotent — re-scheduling the same name never stacks duplicates. Observability joins `cron.job_run_details` with `net._http_response`, so a job whose function returned 500 reads as **failed**, not "the tick fired."
+
+### Cron secret management
+
+Each tick sends `Authorization: Bearer <CRON_SECRET>`, and the function compares it against `Deno.env.get('CRON_SECRET')`. Two copies must agree: the Supabase vault value the function reads, and the bearer baked into each `cron.job.command`. The vault's secrets API only ever returns a **SHA-256 digest**, never plaintext — reading the secret back from it (the original bug) baked a digest into the command, so every tick 401'd.
+
+The plaintext now lives in a single KMS-encrypted source of truth (`genie_cloud_secret.cron_secret`). Writes update the vault and the KMS column together from one plaintext, so they can't drift; the bearer is always built from the decrypted KMS column. Two deterministic checks keep it un-trippable without waiting for a tick to fail:
+
+- **`verifyCronSecret`** hashes the stored plaintext and compares it to the vault digest, reporting `ok`, `mismatch`, `missing_secret`, `missing_vault`, or `indeterminate`.
+- **`validateCronSecretHandling`** is a deploy gate that rejects an LLM-authored cron function that reads `CRON_SECRET` but never compares it, doesn't guard the empty/unset case, or lacks a 401 path.
+
+Already-broken projects self-heal by rotating (which mints a new secret, writes both stores, and re-issues every job) or by rescheduling any job. Verify all of it on the admin cron page or `/test/cron` — **Verify secret**, **Rotate secret**, **Run now** (which reports the real HTTP status), and a **Copy debug JSON** export.

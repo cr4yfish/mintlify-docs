@@ -1,0 +1,242 @@
+---
+title: Admin tools
+description: The internal admin area — dashboard, blackbox explorers, model config, pipeline tester, proxy usage, speed charts, leaderboard, analytics, credit management, and brain re-graph.
+---
+
+Genie ships with an internal admin area under `/[lang]/admin` that operators use
+to inspect the platform, debug runs, tune the model matrix, and manage credits.
+Every surface below is gated server-side with `checkIfUserIsAdmin` — non-admins
+get a `not authorized` response before any query runs.
+
+<Note>
+Everything on this page is internal and admin-only. These pages are not part of
+the product a normal user sees, and most are reached from the quick-links grid
+on the admin dashboard (`/[lang]/admin`).
+</Note>
+
+## The admin area at a glance
+
+| Page | Route | What it does |
+| --- | --- | --- |
+| Dashboard & activity feed | `/admin` | Recent platform events with a badge filter; quick-links to every other tool. |
+| Blackbox database | `/admin/blackbox` | Browse the `GenieLogs` telemetry table by run id or project id. |
+| Blackbox events | `/admin/[projectId]/events` | Per-project preview-iframe telemetry (clicks, navigations, errors). |
+| LLM model config | `/admin/llm-models` | Assign which model each agent runs on, per audience tier, with no redeploy. |
+| Pipeline tester | `/admin/pipeline-tester` | Dry-run the prompt → SUM → tech-lead → plan path without deploying. |
+| Proxy usage | `/admin/proxy` | Inspect one user's Genie LLM-proxy calls, tokens, and errors. |
+| Speed chart | `/admin/speed` | AI-timing percentiles, anomaly filtering, and latency trends. |
+| Leaderboard | `/admin/leaderboard` | Rank users by a chosen SUM-quality metric over a window. |
+| User analytics | `/admin/users/[userId]` | Per-user scoring, profiling, prediction, and speed summaries. |
+| Brain re-graph | `/project/[id]/brain` | Admin-gated code-graph viewer with a destructive re-graph action. |
+
+Credit management is spread across several surfaces (per-user refunds, self
+credits, workspace credits, reconciliation); see [credit management](#credit-management).
+
+## Dashboard and activity feed
+
+The dashboard's **Recent activity** card shows the most recent platform events —
+assistant messages, top-ups, credit grants, and new projects — with a badge
+filter (`All`, `New project`, `New message`, `Starter grant`, `Top-up`,
+`Grant`). It pulls a wider pool (30 rows) so the filter has data to work with,
+then caps the visible list at the 10 most recent matching rows. Each chip shows
+a count over the pool.
+
+The card renders an explicit UI for every state: a `<Suspense>` skeleton while
+loading, the filtered list when populated, a dedicated empty state when there is
+no activity, and a separate filter-empty state when the pool has rows but none
+match the active badge.
+
+## Blackbox explorers
+
+Genie writes runtime telemetry to the `GenieLogs` DynamoDB table. That table is
+partitioned on `runId` and is deliberately **not** granted a `Scan`, so there is
+no "list everything" view — both explorers browse it through bounded, indexed
+access patterns.
+
+### Blackbox database
+
+At `/admin/blackbox` you look the table up two ways: **by run id** (queries the
+partition key) or **by project id** (queries the `projectId-timestamp-index`
+GSI), returning matching entries newest first. The lookup is a plain GET form,
+so every search is shareable and bookmarkable as a URL and needs no client JS.
+Results render in the shared `BlackboxEventsTable` (level filter, collapsible
+long messages) with a stat summary of rows, errors, and distinct runs above it.
+
+`?limit=` defaults to 200 and is clamped to 1000; `?q=` is trimmed and capped at
+256 chars server-side. Reads can never run unbounded: both query helpers page
+with a per-page `Limit` and bail at a hard ceiling of 25 pages, showing a
+truncation note when the cap is hit.
+
+### Blackbox events
+
+At `/admin/[projectId]/events` you inspect the telemetry the blackbox bridge
+captures from a single project's preview iframe. It is reachable from the
+projects list row actions and from the code-graph page header. It queries the
+same GSI (`ScanIndexForward: false`) with the same paging ceiling, so a noisy
+project can't force an unbounded read. Level buttons filter client-side and long
+messages (serialized snapshots, stack traces) collapse past 200 chars.
+
+Both explorers surface load failures as a localized error rather than a 500, and
+render explicit prompt / invalid / error / empty / data / truncated states.
+
+## LLM model config
+
+At `/admin/llm-models` you choose **which concrete model every agent runs on,
+per audience tier, without a redeploy**. It replaces hardcoded model requests at
+each call site with a DB-backed assignment matrix plus a cached resolver.
+
+- **Catalog** (`llm_model`) — the available models. Editing a row's model id
+  repoints that key at a newer model (for example, point `sonnet` at a future
+  release) with no redeploy. You can also add custom keys routed by their
+  provider (`anthropic` / `openai` / `mistral` / `openrouter`).
+- **Matrix** (`llm_agent_model`) — assign a model per agent, per audience: **Free
+  users**, **Paid users**, **Paid workspaces**, and **Admins (override)**. A cell
+  left on "Default (code)" keeps the agent's built-in default, so an empty matrix
+  reproduces today's behaviour exactly.
+- **Admin override toggle** — when on, admins resolve to the admin audience so you
+  can A/B a new model on yourself before rolling it out.
+
+Resolution loads a cached snapshot (30s TTL, invalidated immediately on any
+write), resolves the audience by precedence (`admin > paid_workspace >
+paid_user > free`), picks an enabled assignment or falls back to the call site's
+key, and delegates to `resolveModel`. The resolver never throws on a config
+error — a DB outage falls back to the last good (or empty) snapshot, so the chat
+path can't break. A write is live fleet-wide within ~30s with no deploy.
+
+## Pipeline tester
+
+At `/admin/pipeline-tester` you exercise the production `prompt → SUM →
+tech-lead → plan` path as a **dry run** that stops at the `FullPlan` output. No
+repo files are written and nothing is deployed, so it's a fast way to iterate on
+prompts and inspect the SUM classification and resulting plan.
+
+You pick a project source: a **throwaway project** (created and torn down with
+dedicated buttons) or an **existing project** targeted by id or slug via an
+audited, RLS-bypassing lookup that runs against the project's real files and
+cloud config but never modifies it. The run defaults to `isFollowup: true` so the
+tech-lead step actually runs (the first prompt of a project skips it). A live
+elapsed counter ticks while a run is in flight, and each completed run is
+appended to an in-session history (capped at 20) with aggregate stats.
+
+<Note>
+SUM and the tech lead run for real, so a run consumes credits on the admin's own
+account. Nothing is deployed and no repo files are written.
+</Note>
+
+## Proxy usage
+
+At `/admin/proxy` you inspect one user's usage of the Genie LLM proxy (OpenAI /
+Resend / Hugging Face) by their **owner id** (the Auth0 `sub`) over a recent
+window (default 30 days, max 90), capped at a max rows read. It renders summary
+cards (total calls, successes, errors, rate-limits, prompt/completion/total
+tokens, average duration), per-provider / per-status / per-model breakdowns, and
+a recent-calls table.
+
+Like the blackbox store, `GenieProxyUsage` has no `Scan` grant, so the only
+efficient read is a Query on the `ownerId` partition key — cross-user questions
+aren't answerable here. The reader is bounded (per-page `Limit`, hard ceiling of
+25 pages). This page is **observability only**: proxy usage is logged but not
+metered or billed, and the page repeats that caveat inline.
+
+## Speed chart
+
+At `/admin/speed` you see AI-timing data as a bar chart plus percentile stat
+cards. Rather than a single average (which a flood of fast requests drags down
+so slow calls disappear), it exposes **p50 / p95 / p99 / max** over the entire
+filtered dataset, so a slow outlier is always visible. Grouped hour/day views
+render median, p95, and max per bucket.
+
+Controls (all persisted in the URL): **Records shown** (25–500, validated against
+an allowlist) and **anomaly filtering** (Tukey IQR fences at k = 3) that drops
+freak points from the chart while keeping them in the table, tagged "anomaly". A
+**Trends over time** section fits a least-squares line over the chosen metric
+(All / Max / p95) at hourly / daily / weekly granularity and classifies the
+direction (rising is worse and red, improving is green). All aggregate columns
+are cast explicitly (`::double precision`, `::int`) for the AWS Data API.
+
+## Leaderboard
+
+At `/admin/leaderboard` you rank users by a chosen SUM-quality fact: **completion
+speed** (lower is better), **prompt scoring** (higher is better), or
+**satisfaction** (higher is better), over a 7 / 30 / 90-day or all-time window.
+Selection lives in the URL so the board is shareable. Ranking happens in SQL with
+`ORDER BY … NULLS LAST` and `LIMIT 50` (fragments chosen from a validated enum,
+never raw input), with explicit `::int` / `::float8` casts. A `minSample` guard
+keeps a single run from topping the board.
+
+## User analytics
+
+The per-user detail page (`/admin/users/[userId]`) shows four compact,
+user-scoped analytics summaries between the credit row and the grants table:
+**prompt scoring** (quality of the user's SUM runs), **profiling** (traits and
+reports), **prediction accuracy** (next-prompt outcomes across the user's
+projects), and **completion speed** (p50 / p95 / p99 latency). Each summary is
+resolved in its own transaction so the page can run them with `Promise.all`, and
+each call is wrapped in `.catch()` so one unavailable source degrades to an empty
+section rather than breaking the page.
+
+## Credit management
+
+Several admin surfaces manage credits, since admins are now billed exactly like
+every other user (the old unlimited-credit bypass was removed).
+
+- **Self credits** — an admin-only panel on `/account/profile` that tops up and
+  inspects the signed-in admin's **own** wallet: switch your own plan (including
+  `unlimited`), grant yourself credits, add top-ups, set per-batch status, and
+  remove batches. Every mutation resyncs the cached `wallet.balance` from the sum
+  of active batches.
+- **Refunds** — a "Refund credits" button on the user-detail page grants a
+  `refund` batch (one-year expiry) to **another** user's wallet and writes a
+  matching ledger row that records the target user and embeds the acting admin's
+  sub in `referenceId` for an audit trail. Amounts are capped at 100,000 and
+  reasons at 200 chars.
+- **Workspace credits** — the workspace billing page carries the same tools for a
+  **workspace's** subscription and wallet: switch plan (including a `Free`
+  sentinel that downgrades), grant, top-up, per-batch status, remove, and a
+  **Sync cached balance** action that reconciles the cache down to the real
+  spendable amount. Gated to platform admins, not the workspace owner/admin role.
+- **Display reconciliation** — a fix (verifiable at `/test/credits-reconcile`)
+  that made the dashboard, users list, and Palantir stop reading the denormalised
+  `wallet.balance` cache and instead compute the **spendable** balance (active,
+  non-expired, plan-matched batches) in SQL — the same figure the consume path
+  and the per-user card use — so the surfaces no longer over-count.
+- **Paginated tables** — the user-detail credit-grants and projects tables
+  paginate client-side at 10 rows per page, keeping the rendered DOM bounded for
+  long-lived accounts.
+
+## Brain re-graph
+
+The dedicated project Brain subpage (`/project/[id]/brain`) is gated to admins
+(the settings-dialog Brain tab stays read-only and viewer-scoped). It carries an
+admin-only **"Re-graph codebase"** button that wipes the project's code graph and
+queues a fresh extraction via the same `regenerateCodeGraphAction` the admin
+`/graph` page uses. The action re-checks admin status server-side, wipes the
+graph rows, reads the project's `current` S3 branch under a hard file cap, and
+queues extraction via `after()` so the click returns fast.
+
+<Note>
+Re-graphing loses temporal history — every node is re-anchored at the latest
+deployment id. The confirm dialog spells this out before the destructive step.
+</Note>
+
+## The "Copy debug JSON" convention
+
+Every admin surface above exposes a **Copy debug JSON** button that copies the
+relevant state or result — the current query, filters, summary, and rows — as
+pretty-printed JSON to the clipboard, so an operator can paste it straight into a
+bug report or chat. It uses a `safeStringify` that caps oversized strings, breaks
+cycles, handles bigint, and never throws. When the affordance lives inside an
+otherwise-public component (like the admin button on a shared view), the button
+is gated to admins. This is a repo-wide convention for internal features, so you
+can expect it on any admin-gated tool.
+
+## Testing and verification
+
+Every admin surface has a companion `/test/<label>` harness that drives its pure
+UI through every data state (loading, success-with-data, success-empty, and
+error) with mock data and no-op handlers — no admin session, database, or live
+AWS table required. For example: `/test/admin-activity-feed`,
+`/test/admin-blackbox-db`, `/test/admin-proxy-usage`, `/test/admin-leaderboard`,
+`/test/admin-user-analytics`, `/test/admin-self-credits`,
+`/test/admin-refund-credits`, `/test/workspace-admin-credits`,
+`/test/credits-reconcile`, `/test/llm-model-config`, and `/test/brain-regraph`.
