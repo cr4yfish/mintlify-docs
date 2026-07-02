@@ -111,6 +111,14 @@ The write-capable agents (the first-prompt main agent and the scoped code agent)
 blueprints. The tech-lead is discovery-only — it names an `id` in its plan, and the scoped
 agent performs the copy.
 
+When a feature blueprint already covers a request, the tech-lead planner hands down its
+`id` and stops there — it must **not re-specify the blueprint's internals**. An `ai-chat`
+prompt, for example, resolves to a single `add_registry_entry({ id: "ai-chat" })` that
+installs the streaming edge function, the `useAiChat` hook, and the `ChatPanel` UI together;
+the planner is explicitly steered away from hand-authoring an equivalent edge function and
+files, which would be slower, less consistent, and would skip the vetted, validated install
+path the registry exists to provide.
+
 For frontend files the tool resolves destinations from `targetPath`, rewrites imports against
 the project's aliases, refuses to overwrite conflicting user edits, merges any new
 `package.json` dependencies, and writes everything through the project's existing save path.
