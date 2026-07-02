@@ -33,6 +33,43 @@ recovery banner that auto-retries once and then offers a manual **Retry**
 (hard-capped at three attempts), reusing the already-persisted prompt so no
 duplicate is created.
 
+## Understanding your prompt (the SUM)
+
+Before Genie plans or builds, a **SUM** stage rewrites your raw message into a
+structured brief — the improved, unambiguous version of what you asked for. It is
+the first thing the pipeline does, and everything downstream (planning, the
+deployment phases, the pipeline tester, leaderboard scoring) reads the SUM rather
+than your original text.
+
+The SUM also classifies the turn:
+
+- **Action** — whether the turn is a **build** or a **chat/research** answer. A
+  `Chat` verdict routes the turn to the research pipeline instead of the build
+  pipeline (this is how "build what's on the screenshot" with no attachment
+  becomes a polite "please attach it" reply).
+- **Task scale** (follow-up turns only) — **`small`** or **`large`**, which sizes
+  the planning that follows.
+
+### Task scale sizes the planner
+
+A color tweak, a copy change, or an image swap does not need the full
+research-heavy, contract-generating planning pass that a multi-feature build does.
+The task-scale verdict lets the tech lead pick the right mode:
+
+| | `large` (default) | `small` |
+| --- | --- | --- |
+| Planner model | Sonnet | Haiku |
+| Plan shape | up to ~4 steps + export contracts | exactly **1 step** (enforced) |
+| Parallel batch build | available | structurally impossible |
+| Planner toolset | full research (web search, skills, registry, branding) | lean — reads and validation only; MCP discovery skipped |
+| Loop bound | timeout only | timeout **+** an 8-step hard cap |
+
+The single-step guarantee is structural, not just a hint: a small plan is
+collapsed to one step, and one step can never trigger parallel batch mode.
+Anything ambiguous defaults to `large`, because misclassifying a big task as
+small hurts plan quality while the reverse only costs a little speed. Force it
+per request in dev with `TECH_LEAD_FORCE_TASK_SCALE=small|large`.
+
 ## Planning and plan approval
 
 For follow-up prompts on an existing project, Genie plans before it codes. The
@@ -210,6 +247,33 @@ is a few seconds of deploy time.
 Only text that *isn't* a repo literal (rendered from a database, CMS, or API)
 falls through to the full agent pipeline. Mixed or ambiguous batches also fall
 through, so the fast-pass never guesses.
+
+## Design and branding
+
+Genie generates a project's visual identity, not just its code. On a first build
+it produces a coherent look and the assets to match:
+
+- **A brand guide.** A small structured-output **branding agent** (running on
+  Mistral) writes a `branding.md` for the project — color palette, typography,
+  component and layout guidance, and do's & don'ts — which later turns read so the
+  app stays on-brand. It's invoked both directly by the planner
+  (`call_branding_agent`) and automatically the first time a theme is set without
+  an existing brand guide, so the documented brand and the live theme stay in
+  lock-step.
+- **A logo and favicon** via `generate_icon`, and a coherent color theme via
+  `update_theme`.
+- **A full PWA manifest and icon set** (apple-touch plus 192/512 regular and
+  maskable), rasterized from the app's real generated favicon. The manifest and
+  icons are served live from storage, so a regeneration takes effect without a
+  redeploy; if no usable favicon is found yet, a valid letter-icon manifest is
+  written as a fallback so the app is never left without an icon set.
+
+<Note>
+  Because this runs under the hood, both surfaces are verifiable on their own
+  admin `/test` pages — `/test/manifest-icons` renders the generated icons as
+  real images on a checkerboard so you can eyeball them (and re-run generation for
+  a project as a one-click fix), each with a **Copy debug JSON** export.
+</Note>
 
 ## Auto mode
 

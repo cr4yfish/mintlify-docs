@@ -112,6 +112,54 @@ while a 30s deduping interval (aligned to the routes' server cache) keeps it
 cheap. Archiving or deleting a project optimistically removes the card from the
 SWR cache immediately, rolling back on error.
 
+## Real-time collaboration and the edit lock
+
+When several people open the same workspace project, only one can actively edit
+(send prompts) at a time. That person is the **editor**; everyone else drops into
+**spectator mode** with the prompt input disabled and an amber banner naming who
+currently holds the lock.
+
+The lock is held in a dedicated DynamoDB store keyed by project, carrying the
+holder's id, a denormalized name/avatar for the badge, and a "last renewed"
+timestamp. Two mechanisms keep it honest and race-free:
+
+<CardGroup cols={2}>
+  <Card title="Atomic claims" icon="lock">
+    A claim is a single conditional write — it succeeds only if the row is
+    absent, already yours, or **stale** (idle past the ~2-minute threshold). Two
+    people racing for a free lock can never both win.
+  </Card>
+  <Card title="Live state over SSE" icon="bolt">
+    Clients subscribe to a Server-Sent Events stream that polls the store every
+    ~1.5s and pushes a delta only when the lock changes, so a release propagates
+    to everyone else in ~2 seconds instead of the old 15-second poll lag.
+  </Card>
+</CardGroup>
+
+The editor's lock renews on activity (throttled to at most once every 10s) and a
+TTL hard-deletes it if a tab dies without releasing. When the lock frees, a
+waiting spectator's client reclaims it immediately rather than waiting for the
+next event.
+
+### Admin spectators
+
+A site admin can open **any** project — including workspace projects whose
+workspace they don't belong to. Such an "admin spectator" is handled so they
+never disrupt the real collaborators:
+
+- **They never take the lock.** The claim route refuses to write a lock row for
+  an admin spectator (enforced server-side), so ordinary members only ever see a
+  *real* editor as the holder — never a lurking admin.
+- **They're never locked out.** An admin sees the exact same amber banner and
+  tinted input as a locked-out member when someone else is editing, but their
+  input stays **enabled** so they can still type. Keeping the two states visually
+  identical means the prompt input never restructures as the lock changes.
+
+The whole lock state machine is pure and exercisable at `/test/project-lock`,
+which runs every signal combination through the derivation with expected
+outcomes and a live section (plus a **Copy debug JSON** export) you can point at
+a real project id.
+
 ## Sidebar navigation
 
 The workspace sidebar (`workspace-home-sidebar.tsx`) is the persistent left nav.

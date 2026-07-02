@@ -72,6 +72,61 @@ In production, every DB call goes through the `transaction()` wrapper, which set
 
 The global setup script is idempotent (`CREATE OR REPLACE` / `IF NOT EXISTS` / `ON CONFLICT`), so a platform admin can push global-script updates onto an already-provisioned instance without re-provisioning. The admin user-detail page has a **Re-run migration** button (with a "Copy migration JSON" debug export) that runs `globalSetupScript` against a single user's cloud — the supported way to roll out shared functions like `sync_user_profile` to existing user-level clouds.
 
+## App authentication and user roles
+
+The apps Genie builds can have their **own** end users — people who log into
+*your* app, distinct from your Genie workspace members. Authentication is
+**platform-provided**, so Genie never scaffolds a login screen and never invents
+email/password fields:
+
+- **A drop-in `<LoginButton />`**, backed by the `auth.genie-app.de` broker, is
+  the single unified sign-in entry point. There is no user secret to configure
+  and no auth UI to build — when an app needs logged-in users, Genie places
+  exactly one `<LoginButton />` rather than a hand-built form.
+- **A templated role system.** Every Genie Cloud app ships `roles` / `user_roles`
+  tables seeded with four default roles (`admin`, `moderator`, `member`,
+  `guest`), a default-role assignment on signup, and a `has_role(...)` check that
+  RLS policies and app code use to gate access.
+
+<Warning>
+  Fake or mock login UI is banned outright, and email/password auth does not
+  exist on the platform. A request like "an admin area and a separate contractor
+  area" becomes normal navigable pages plus one `<LoginButton />` and a
+  role-based access suggestion — never a login form or a "log in as admin"
+  role-picker screen.
+</Warning>
+
+### Multi-role apps
+
+When you ask for distinct user types with separate areas, Genie builds a proper
+multi-role app and guards three things that used to fail silently:
+
+<Steps>
+  <Step title="The roles are actually created">
+    Any role beyond the four seeded defaults is explicitly inserted into the
+    `roles` table **before** any `has_role` check or RLS policy references it — a
+    `has_role('contractor')` against a role that was never created silently
+    matches nobody.
+  </Step>
+  <Step title="Role names stay lowercase">
+    Role names are case-sensitive, so an accidental `Admin` would be a *second*
+    role distinct from the seeded `admin`. The database agent defensively
+    lower-cases and trims every role name it writes, so a capitalized duplicate
+    can never reach the table.
+  </Step>
+  <Step title="The names are handed back to you">
+    You assign people to roles **by name** in **Project Settings → Users**, so
+    the exact role names land in the build summary *and* in a required "Assign
+    people to the new roles" to-do — with what each role does and an **Ask Genie
+    AI** button that hands role setup straight back to the assistant.
+  </Step>
+</Steps>
+
+Role and user management (approving app users, adding roles, toggling the auth
+provider) is fully reachable by the Workspace Chat Agent through its secure
+actions, so you can ask Genie to manage app access rather than only clicking
+through Project Settings.
+
 ## Storage
 
 Storage uses two reserved buckets: `public-assets` (public) and `private-storage` (private). Paths passed to `.upload(...)` are **project-relative** — the runtime deterministically prefixes the project id, and the storage RLS policies require the first path segment to equal the sub-project id, so you never prepend the project id or bucket name yourself.
@@ -90,6 +145,20 @@ A content validator flags path defects on every file write: unknown buckets, wri
 ## Edge functions
 
 Edge functions are Deno functions deployed to your Supabase project and invoked with `supabase.functions.invoke(...)`. The `edge_functions_agent` deploys them and mirrors each function's source into your app's S3 project at `supabase/functions/<slug>/index.ts` for discovery.
+
+### Inspecting deployed functions before changing them
+
+Listing slugs is not the same as knowing what a function does. Genie's planner (the tech lead) and its deploy agent share one **`buildEdgeFunctionReadTools`** builder — a single source of truth so the two agents can never drift apart — that exposes three read tools:
+
+| Tool | What it returns |
+| --- | --- |
+| `list_edge_functions` | The slug list — what functions exist. |
+| `get_edge_function` | A function's metadata. |
+| `get_edge_function_source` | The **live deployed `index.ts`**, read out of the function's eszip archive (capped at 2,000 lines) — authoritative regardless of whether the S3 mirror landed in the planner's repo snapshot. |
+
+All three are part of the read-only planner toolset (`getGenieCloudTools({ readOnly: true })`), not just the deploy agent, so the planner can inspect source first-hand. The `supabase/functions/<slug>/index.ts` bash mirror stays as a secondary discovery path, but `get_edge_function_source` is the authoritative read.
+
+An **EDGE FUNCTION PRE-FLIGHT** rule in the tech-lead prompt — mirroring the SCHEMA PRE-FLIGHT rule for tables — makes inspection mandatory: before planning an update to an existing function (or code that depends on it), the planner must read its source, because "listing slugs with `list_edge_functions` is NOT inspection." That stops the planner from proposing "update function X to also do Y" or "the frontend calls X" from the slug alone. The scoped coding agent is likewise told the mirror path is **read-only for discovery** — it may `bash cat`/`bash ls` the mirrored source but never `create_file`/`edit_file` under `supabase/functions/`, since every edge-function change goes through `edge_functions_agent`.
 
 ### JWT authentication
 
