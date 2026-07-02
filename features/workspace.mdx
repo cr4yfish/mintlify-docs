@@ -1,0 +1,212 @@
+---
+title: Workspace
+description: The signed-in home for building apps with Genie — dashboard, projects, chat, navigation, switching, settings, onboarding, and the command palette.
+---
+
+The workspace is where a signed-in user lives. It groups a user's projects, its
+Genie chat agent, its members, and its settings under a single URL space at
+`/[lang]/workspace/[workspace]`. A user can belong to several workspaces and
+switch between them; each one has its own projects, credits, billing, and
+access control.
+
+## Entering the workspace
+
+A signed-in visitor who hits the landing page (`/`, `/en`, `/de`) is routed
+straight to their workspace dashboard. The landing page paints a **branded
+gradient interstitial** first, then resolves the destination on the client
+(`resolveWorkspaceEntry`) so no database round-trips block the first paint. The
+target is the "latest workspace" cookie when it still points at a workspace the
+user belongs to, otherwise their first workspace.
+
+<Note>
+The public marketing landing page is static and identical for everyone. Users
+stay on it only via the `?stay=true` escape hatch, a `?prompt=` deep-link, or
+when they have no workspace yet (in which case the hero's prompt-create flow
+lets them start a first project).
+</Note>
+
+Onboarding gates entry: `redirectIfOnboardingIncomplete` sends any user without
+a completed profile to `/[lang]/onboarding`, failing safe toward onboarding on
+a missing or unreadable profile.
+
+## The dashboard (home)
+
+The dashboard (`/workspace/[workspace]`) is the workspace home. Its content
+fades in on load — the greeting, the prompt input, and the projects grid animate
+up with a staggered, reduced-motion-aware transition that mirrors the landing
+hero. Everything below the hero sits on a rounded panel that lifts over it.
+
+The dashboard has three main regions:
+
+<Steps>
+  <Step title="Hero prompt">
+    A two-tab switcher — **Ask Genie** and **Create a project** — leads the page.
+  </Step>
+  <Step title="Recent projects (compact)">
+    A peek at the two most-recent projects plus a persistent "new project" CTA
+    card, with a "View all" link to the full Projects page.
+  </Step>
+  <Step title="Activity log">
+    The workspace activity feed, streamed in behind its own Suspense boundary so
+    it never holds up the rest of the page.
+  </Step>
+</Steps>
+
+### Prompt input and quick actions
+
+The **Ask Genie** tab hosts a Genie-styled input wired to the workspace chat
+agent. It looks like the classic project-creation prompt (same textarea and
+animated gradient-glow submit button) but is relabelled and points at Genie. On
+desktop it's a single-line bar that grows as you type; on mobile it opens as a
+multi-line textarea.
+
+- **Submitting** navigates to the real chat page
+  (`/workspace/[id]/chat?q=…&from=workspace`), which auto-sends the query on
+  mount. A real navigation keeps browser Back and the sidebar's active states
+  correct.
+- **Autocomplete** ranks rows from the same section builders the command palette
+  uses (navigation, recent chats, actions), scored with cmdk's filter and
+  rendered in a portal so it never reflows the page.
+- **Suggestion bubbles** below the input propose up to three next actions,
+  generated server-side from workspace signals (projects, recent chats,
+  membership). A "create a project" bubble is always one of the three.
+- **Quick actions** are verbs you run without leaving the input. Selecting one
+  puts the input into that action's mode — a **`text`** action adds a removable
+  prefix chip and runs on submit (e.g. **Create new Project**, the same flow as
+  the homepage prompt), while a **`panel`** action swaps the input for its own
+  component (e.g. the admin-only **Create from a Claude design** dropzone). The
+  registry lives in `genie-actions.ts`; adding an action is a single entry.
+
+The **Create a project** tab renders the classic `PromptInputSwitcher`. Only the
+active tab's panel mounts, so switching is a deliberate swap, not a layout shift.
+
+## Projects
+
+### Projects page
+
+The dedicated **Projects** page (`/workspace/[workspace]/projects`) hosts the
+full project browser: search, sort, pagination, and an **All in Workspace /
+Mine / Archive** filter. The filter is URL-driven (`?filter=`), shareable, and
+clamps untrusted values back to a safe default. Archive is a filter, not a
+separate page — the old `/archive` route was removed.
+
+The list is the shared `RecentProjects` component (also used on the compact
+dashboard widget and, historically, the landing page). It renders explicit
+states for **loading**, **success-with-data**, **success-empty**, **error (with
+retry)**, and a subtle **background-refreshing** indicator. A persistent "New
+project" button in the header is always visible regardless of list state and
+routes into the workspace's Genie chat with a localized first-person prompt.
+
+<Note>
+Access control is never bypassed: "All in Workspace" shows every project the
+caller is allowed to see, never projects they aren't a member of. Queries filter
+`p.workspace_id = ${workspaceId}::uuid` with an explicit cast for the AWS Data
+API.
+</Note>
+
+### Freshness
+
+Projects are fetched client-side with SWR. The list revalidates on focus, on a
+60-second poll, and on mount, so an open tab stays within ~60s of the server
+while a 30s deduping interval (aligned to the routes' server cache) keeps it
+cheap. Archiving or deleting a project optimistically removes the card from the
+SWR cache immediately, rolling back on error.
+
+## Sidebar navigation
+
+The workspace sidebar (`workspace-home-sidebar.tsx`) is the persistent left nav.
+It's collapsible to an icon rail and **defaults collapsed** on a fresh load.
+
+- **Header** holds the workspace switcher trigger, a collapse toggle, and a
+  **Search** button (opens the command palette; it's an action, not a route).
+- **Nav list** is a flat icon+label group: **Overview**, **Projects**, **Genie
+  AI** (routes to `/chat`), and **Settings** at the bottom. Settings is a
+  collapsible listing its sub-pages (General, Members & Roles, Integrations, PII
+  Detection, Activities, Billing), each gated by role and feature flags.
+- **Footer** pins an account row (`WorkspaceSidebarUser`) that opens a dropdown
+  with Profile / Settings / Subscription links and Logout. It renders explicit
+  loading, error, anonymous, and signed-in states and collapses to just the
+  avatar on the icon rail.
+
+The **current page** renders as a solid dark "blacked-out" pill. Active state is
+derived by comparing the locale-relative pathname against locale-relative hrefs
+(both from next-intl's navigation helpers) so highlighting works on the
+prefix-less default locale.
+
+### Instant navigation
+
+Clicking between workspace pages preserves the sidebar and navbar chrome. The
+route's `loading.tsx` only shows the full-screen branded interstitial for the
+genuine landing→workspace entry hand-off (detected via an in-memory marker with
+a 30s TTL); every intra-workspace navigation shows a lightweight
+chrome-preserving skeleton instead.
+
+## Workspace switching
+
+The desktop dropdown and the mobile switcher drawer both source their list from
+the same server-resolved membership list, so they stay in sync. The mobile
+drawer pins the current workspace at the top, lists all others sorted by name,
+paginates after 10 (client-side "Show N more"), and only shows a search box when
+the user has more than 10 workspaces. It renders explicit states for data,
+empty (only the current workspace), no-results, loading, and error.
+
+## Settings
+
+The settings area (`/workspace/[workspace]/settings`) is admin/owner-gated
+throughout. The main page is an overview with a card grid linking to each
+sub-section, inline toggles for the two simplest settings, and a read-only
+workspace-info block.
+
+| Route | Purpose |
+| --- | --- |
+| `/settings/members` | Members table with role management and invites |
+| `/settings/billing` | Credit charts, plan and seat overview (plan section owner-only) |
+| `/settings/integrations` | MCP server management |
+| `/settings/pii` | PII detection rules |
+| `/settings/activity` | Paginated audit log |
+
+The Billing card and nav entry appear only for owners with workspace billing
+enabled. Non-admins see a single error message.
+
+## Onboarding
+
+New users land in a short guided flow (`OnboardingFlow`) that collects a name,
+account type, and role, then turns a personalized welcome prompt into their
+first project and build. Two server actions back it: one persists the profile
+and stamps `onboardingCompletedAt`, the other creates the welcome project and
+starts its first build on the durable Workflow SDK path. Admins (in any
+environment) and developers can re-run onboarding on demand; normal completed
+users are bounced to their newest project.
+
+## Command palette
+
+The command palette (⌘/Ctrl+K, also opened from the sidebar and navbar Search
+buttons) lists navigation and action rows built by `sections.tsx`, the single
+source of truth. The shared open flag lives in `LandingNavbarProvider` so the
+sidebar and navbar can both open it.
+
+- **Hides the current-page link.** Rows whose `href` matches the current route
+  are dropped as noise; the project "Back to project" row only appears when
+  settings is open.
+- **Admin dashboard row.** Admins get an extra nav row deep-linking to `/admin`,
+  only rendered once admin status is confirmed (never optimistically).
+- **Chat mode.** The palette can switch into Genie chat in place. Closing a
+  non-empty in-menu chat prompts a confirmation (with a "Don't show again"
+  opt-out) since the conversation, though saved, disappears from view.
+- **Auto-resume recent chat.** If the user was active in a workspace chat within
+  the last 5 minutes, the palette opens directly into that conversation — decided
+  during the opening render (from a `localStorage` record) so there's no
+  list-then-chat flash.
+
+## Footer
+
+Every workspace subpage renders a light-themed footer wired into the shared
+layout. Its main feature is the DE/EN language switch, which sets the
+`NEXT_LOCALE` cookie and does a full-page navigation so the server re-renders in
+the new locale immediately. It pins to the bottom of the inset on short pages.
+
+<Note>
+Everything in a workspace must stay usable and editable by the Workspace Chat
+Agent (Genie AI). When adding workspace content or features, expose the matching
+read and write capabilities to Genie's tools so it can act on the user's behalf.
+</Note>

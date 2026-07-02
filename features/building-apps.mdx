@@ -1,0 +1,256 @@
+---
+title: "Building apps"
+description: "How Genie turns a natural-language prompt into a planned, coded, and deployed web app."
+---
+
+Genie builds web apps from plain-language prompts. Every prompt runs through a
+durable pipeline that plans the work, writes the code, and deploys the result —
+resuming on its own even if you close the tab. This page walks through that
+pipeline end to end, from your first prompt to a live deployment.
+
+## The first prompt
+
+When you describe an app on the landing page (or ask the workspace chat agent to
+"build me something that does X"), Genie creates the project and starts the
+opening build in a single step — no empty canvas, no second click.
+
+That opening build runs through the same durable workflow every later prompt
+uses, so the run persists your message, drives the build to completion
+server-side, and does not depend on a browser staying connected. When you open
+the project page, it resumes the in-flight run from the deployment's stored run
+id, so the chat streams the live build instead of showing an empty shell.
+
+<Note>
+  The first build is intentionally exempt from plan approval. There is no
+  tech-lead plan for a brand-new project — the build is driven directly from
+  your prompt — so blocking that first "wow" build behind a review would only
+  add friction.
+</Note>
+
+Starting the turn is best-effort. If the durable queue has a transport blip and
+the turn fails to enqueue, the project is never lost: the project page shows a
+recovery banner that auto-retries once and then offers a manual **Retry**
+(hard-capped at three attempts), reusing the already-persisted prompt so no
+duplicate is created.
+
+## Planning and plan approval
+
+For follow-up prompts on an existing project, Genie plans before it codes. The
+**analyze** stage runs a tech-lead agent that inspects your project and produces
+a structured `FullPlan` — an ordered list of steps, each with its target files,
+an export contract, and a `needs_ui_design` flag.
+
+Planning is a hard prerequisite for coding. The coding stage only runs when
+*this* turn's analyze stage produced a fresh plan:
+
+- **Completed plan** → coding runs.
+- **Disabled** (the model decided there is no coding task, e.g. a plain
+  question) → coding is skipped, but Genie still replies and the turn settles as
+  a success.
+- **Failed** (both tech-lead attempts failed) → coding and the reply are both
+  skipped, and the turn settles as failed.
+
+This gate exists because coding reads the plan from storage. Without it, a turn
+that produced no fresh plan could silently execute the *previous* turn's
+plan — coding without planning.
+
+### Approving a plan before the build
+
+Plan approval (where enabled) answers you right after planning with a
+non-technical summary of what Genie intends to build, so you can catch a wrong
+plan before any code is written. You get two actions:
+
+- **Approve & build** — Genie codes the stored plan, no re-planning.
+- **Request changes** — the planner re-runs with your feedback plus the existing
+  plan, and produces a minimally-changed revision to review again.
+
+Approval is just another chat turn, so it rides all the normal auth, credit, and
+streaming plumbing. If a plan is superseded (you sent a new prompt in the
+meantime), approving the stale card safely fails and the UI refreshes instead of
+building the wrong thing.
+
+## The build pipeline
+
+The pipeline card in the chat narrates the whole turn: **Planning → Coding →
+Publishing**, plus a per-step breakdown and a header status label ("Genie is
+thinking…", "Genie is writing code…", "Genie is publishing…", "Done").
+
+### Step progress and states
+
+While coding runs, the card shows live per-step progress: every plan step, its
+status, its in-step todo checklist, and its timing. In parallel mode each step
+carries an `Agent N` badge so you can see which agent is doing what and where
+time goes. All of this flows through the existing deploy-status row, so the card
+fully recovers after a page refresh with no extra endpoints.
+
+Each step renders one of these states, and every state is explicit:
+
+| State | Meaning |
+| --- | --- |
+| `pending` | Seeded from the plan, not started yet. |
+| `running` | In flight (segmented todo ring + live elapsed timer). |
+| `completed` | Finished successfully. |
+| `failed` | The step errored or produced nothing. |
+| `interrupted` | Was still running when the run was killed (timeout/abort). |
+
+A running step is downgraded to `interrupted` once the pipeline is terminal, so
+a crashed writer can never leave an eternal spinner.
+
+### Dynamic ETA
+
+While a build is in flight, the card header shows an ETA that revises itself on
+every poll — comparing the predicted per-unit pace to the actual elapsed time
+and adjusting **only ever upward**. A stalled unit (like the long build/deploy
+tail) makes the estimate grow rather than expire. There is no "takes longer than
+expected" dead-end anymore: an honest, rising `~Xm Ys` replaces it.
+
+### Completed-turn affordances
+
+A fully green turn exposes three pill actions in a horizontal, scrollable row:
+
+- **Preview** — opens the deployed version, labelled with the per-project serial
+  version (`Preview v3`). Disabled as a no-op when this version is already live.
+- **Rollback** — restores this turn's version (with a confirm dialog).
+- **Remix** — starts a new project from this state.
+
+These render **only** on a fully successful turn. Partial, failed, aborted, and
+errored turns hide the row — there is nothing safe to preview, roll back to, or
+remix from — and instead surface their own affordances (below).
+
+### When something goes wrong
+
+A terminal failure shows a calm, plain-language **"What happened?"** explainer
+(a dialog on desktop, a bottom drawer on mobile) that reassures you your app was
+not changed and suggests what to try next. The copy is keyed to the failure
+kind:
+
+- **failed** — Genie ran into a problem and had to stop.
+- **partial** — some parts shipped and are live; the rest were left out.
+- **rolledBack** — a parallel batch hit a problem, so everything was undone to
+  avoid leaving your app half-finished.
+- **aborted** — the attempt was stopped before it finished.
+
+## The scoped coding agent
+
+Coding executes the plan through the **scoped code agent**, which runs one plan
+step at a time, each in its own freshly-built message context. Rebuilding the
+context per step means step N never drags along the full transcript of steps
+1…N-1.
+
+Model selection is per step, driven by the plan's `needs_ui_design` flag —
+"does this step need visual design work?", not "is it hard?":
+
+| `needs_ui_design` | Model | For |
+| --- | --- | --- |
+| `true` | Sonnet | Components, pages, layout, styling — anything judged by how it looks. |
+| `false` | GPT-5.5 | Logic, data layer, hooks, config, wire-up, behavior-only fixes. |
+| (missing) | Sonnet | Safe default — assume design is needed so quality never regresses. |
+
+The agent is resilient to a slow or silent provider. A per-chunk inactivity
+watchdog fast-fails a dead stream early (10s on the first attempt) and widens on
+retry (40s). Steps escalate models when they stall — a mis-classified non-UI
+step jumps to Sonnet, and a repeatedly-stalling step downgrades to lower-latency
+Haiku for the remainder. On four consecutive stalls the loop stops and tells
+you, via the finish response, that upstream AI providers are overloaded and to
+try again later.
+
+<Note>
+  The follow-up coding stage runs on a **durable** agent by default, so it has
+  no wall-clock time budget — a long build folds into the durable run and cannot
+  be cut off by an 800-second limit.
+</Note>
+
+## Coding retries and self-healing
+
+If the coding step does not fully succeed, the planner's work is not lost — the
+full plan was persisted before coding ran. The card shows a **"Retry coding"**
+button that re-runs *only* the coding stage against that stored plan: no
+re-planning, no greeting.
+
+The retry is smart about what to replay:
+
+- If the failed run's edits were **rolled back**, it replays the whole plan.
+- If work **shipped**, it drops the already-completed steps and continues
+  exactly where it stopped.
+
+Cloud work (table creations, edge functions, buckets) survives a rollback, so
+the retry strips already-applied cloud tasks from the replayed plan — and an SQL
+idempotency net turns any slipped-through duplicate `CREATE` into a benign
+"already exists, skipped" success.
+
+Genie can also heal itself mid-run. When a parallel batch fails a step but a
+later cleanup/reconcile pass fixes the divergence and the turn still ships, the
+card reads **"Done — Genie fixed itself"** (an emerald "Genie fixed itself"
+chip) instead of an amber partial — because the run genuinely recovered.
+
+## Parallel follow-up coding and merge
+
+For wide plans, independent steps run concurrently instead of one after another.
+Genie builds **dependency waves** from the plan's file graph: two steps are
+serialized only when they touch overlapping files or one creates a file the
+other edits. Steps within a wave run in parallel, each as its own scoped agent
+with a fresh context; the next wave starts once its dependencies land.
+
+When two parallel steps legitimately co-own the same file, a deterministic N-way
+three-way merge engine reconciles their edits: non-overlapping changes merge
+byte-identically, same-anchor insertions union together, and truly conflicting
+edits are surfaced as structured conflicts rather than silently corrupting the
+file. A parallel batch is atomic — if one step fails, every file edit is rolled
+back so nothing ships half-finished (cloud changes are the exception; they are
+not reverted).
+
+## Deterministic edit fast-pass
+
+Not every change needs the agent pipeline. An inline preview-text edit that
+resolves to a literal already in your code is a plain search-and-replace — so
+Genie skips the LLM entirely (no planning, no coding, no finish summary) and goes
+straight to applying the edit, writing to storage, and deploying. The whole loop
+is a few seconds of deploy time.
+
+Only text that *isn't* a repo literal (rendered from a database, CMS, or API)
+falls through to the full agent pipeline. Mixed or ambiguous batches also fall
+through, so the fast-pass never guesses.
+
+## Auto mode
+
+Auto mode lets Genie keep building on its own. Each round, a durable server-side
+loop re-enters the previous response's suggested next prompt as the next
+prompt — so it keeps going even if you close the tab.
+
+Because it keeps prompting (and spending credits) unattended, the first time you
+enable it Genie explains how it works and asks you to confirm. The loop stops
+when any stop criterion is hit:
+
+| Reason | Default |
+| --- | --- |
+| You turned the toggle off | — |
+| Credit balance too low | not `> 10` per round |
+| Timeout | 60 min |
+| Max prompts reached | 10 prompts |
+| No sensible next prompt | — |
+| A turn failed to start | — |
+
+Auto mode charges nothing extra — each round reserves and settles credits like
+any normal turn. Its prompts render with a distinct "Auto mode" divider, and
+each turn's pipeline card starts collapsed to keep the back-to-back scrollback
+compact.
+
+## Deployment status
+
+Deployment is the last leg of the turn, and Genie is optimistic about it. On the
+first prompt, the commit card's progress circle swaps to a green checkmark the
+moment the last file is written — the work it measures really is done — while the
+status text keeps narrating the publish. The turn no longer blocks for tens of
+seconds waiting on the build, since over 95% of builds succeed.
+
+If a build later fails, the card flips to "Deployment failed." with a fix
+affordance, and the finish-response summary is quietly regenerated in place to an
+honest version (with an amber "revised" notice) that focuses on getting the app
+published again.
+
+Genie also guards against a stuck status. The terminal `deploying` state is
+written externally by the build system; if that write is ever lost, an
+`IN_PROGRESS` deploy older than five minutes is treated as **stale** so the
+status resolves rather than wedging on "deploying" forever. A genuinely live
+build still holds the status exactly as before, and the server always
+re-arbitrates before allowing a new turn.

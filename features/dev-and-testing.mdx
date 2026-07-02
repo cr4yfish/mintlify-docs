@@ -1,0 +1,208 @@
+---
+title: "Developer and testing tools"
+description: "Internal QA tooling for Genie: the /test index, live tests, test harnesses, code-health trackers, and the reactDoctor ruleset."
+---
+
+Genie ships a set of internal developer and QA tools that never reach production
+users. They exist to help you reproduce bugs in isolation, keep the test suite
+fast and deterministic, track code health over time, and enforce React and
+design conventions. This page is a map of those tools and how to reach them.
+
+<Note>
+Everything on this page is developer-only. The `/test` index and its pages are
+gated to non-production environments, and the code-health trackers and
+reactDoctor ruleset are maintainer workflows — none of it is exposed to end
+users.
+</Note>
+
+## The `/test` index
+
+`/test` (also `/en/test`, `/de/test`) is an auto-generated index of every dev/QA
+page under `src/app/[lang]/test/`. You do not register pages anywhere: the index
+is derived from the filesystem, so adding a `test/<name>/page.tsx` makes it
+appear automatically on the next request.
+
+### How it works
+
+`src/app/[lang]/test/page.tsx` is a Server Component. At request time it reads
+the route folder with `node:fs` and lists every subdirectory that contains a
+`page.(tsx|ts|jsx|js)` as a link. The label is derived from the folder name
+(`pipeline-step-progress` becomes "Pipeline Step Progress") and the route slug
+is shown alongside it.
+
+Because Next.js App Router has no runtime "list all routes" API, the index has
+to read the source tree — which only exists under `next dev` or a plain Node
+server, not in a bundled/serverless build. Since these are developer tools
+anyway, the index is **gated to non-production**: when `NODE_ENV === "production"`
+it returns `notFound()` (404). The individual test pages are unaffected.
+
+The read is defensive: it is wrapped in `try/catch` (an error renders an empty
+state rather than throwing), only directories with a real `page.*` are listed,
+the list is hard-capped at `MAX_ROUTES = 200`, and long slugs wrap instead of
+overflowing. Chrome text is localized under the `Landing.TestIndex` namespace.
+
+To verify: run `pnpm dev`, open `/test`, confirm every folder is listed, then
+add a throwaway `test/scratch/page.tsx`, reload, and confirm "Scratch" appears.
+
+## Live (real-network) tests
+
+Most of the Vitest suite is offline and deterministic — external services
+(OpenAI, Anthropic, AWS, the database) are mocked. A handful of tests instead
+make **real network calls** to verify behavior a mock cannot prove, such as
+actual LLM output or the live prompt-injection training site. Those tests are
+non-deterministic, depend on secrets and network, and can leave in-flight
+requests open, so they are kept out of the default `pnpm test` run — the same
+separation already used for `e2e` and `integration` tests.
+
+### Suites and commands
+
+| Suite       | Contents                                                    | Command                 |
+| ----------- | ----------------------------------------------------------- | ----------------------- |
+| core        | Fast pure-logic node unit tests (the default inner loop)    | `pnpm test`             |
+| agents      | `src/lib/agents/**/*.test.ts` (heavy AI-SDK import graph)   | `pnpm test:agents`      |
+| dom         | `*.test.tsx` + jsdom `.ts` (React/component tests)          | `pnpm test:dom`         |
+| all         | core + agents + dom in one run (used by CI)                 | `pnpm test:all`         |
+| live        | `*.live.test.ts`, `*.pwn.test.ts` (real network)            | `pnpm test:live`        |
+| integration | `*.integration.test.ts` (real Postgres / RLS)              | `pnpm test:integration` |
+| e2e         | `*.e2e.test.ts`                                              | `pnpm test:e2e`         |
+
+The offline unit suite (~400 files) is split into **core**, **agents**, and
+**dom** so the default `pnpm test` stays a fast inner loop. The split only
+changes which command runs which files — each group keeps `environment: "node"`
+as its base, so a file behaves identically no matter where it lands. Routing is
+automatic: `*.test.tsx` goes to dom, anything under `src/lib/agents/` to agents,
+everything else to core. `pnpm test:all` (and CI) runs all three together.
+
+Live tests self-guard. `sum-agent.live.test.ts` calls the real OpenAI SUM model
+and auto-skips unless an OpenAI key is present. `website-download.pwn.test.ts`
+performs real HTTP fetches against `https://pwn.genie-app.de` and fails loudly
+when the host is unreachable. When adding a live test, name it `*.live.test.ts`
+(or `*.pwn.test.ts`) and gate secret-dependent suites with
+`describe.skipIf(!HAS_KEY)` so a key-less run stays green.
+
+## Test harnesses
+
+Harnesses let you drive a complex component through every data state in
+isolation, without needing a real turn or a real browser feature.
+
+### Pipeline view harness
+
+`/test/pipeline-view` mocks every input to the chat **pipeline card**
+(`PipelineView` — the analyze → code → deploy status card). It targets the class
+of bug where the card stays "loading" after a turn finished. `PipelineView`
+reads from many independent sources (chat status, pending tool output, the
+analyze/code tool parts, and the deploy-status fields), and any one of them can
+keep the spinner alive. The harness exposes every source as a control, renders
+the real card live, and prints a **"Why still loading?"** readout that names the
+exact trigger(s) — recomputed with the same pure helpers (`computePipelineSteps`)
+the component uses. Captured real-world stuck turns load as one-click presets
+(code `output-error`, analyze-failed/code-skipped, timed-out mid-run, and a
+timing-label case).
+
+A companion **admin debug dialog** (a bug icon in the card header, shown only
+when `useIsAdmin()` is true) dumps the live state of a real in-flight turn:
+gating flags, derived values, the per-step table, and the raw
+`deployStatus` JSON with a one-click **Copy JSON** button.
+
+### WebMCP test page
+
+`/test/webmcp` is the live production example for
+`@cr4yfish/react-web-mcp`, Genie's React bindings for the **WebMCP** web
+standard, which lets a page expose its functionality as tools that in-browser AI
+agents (Gemini in Chrome, Copilot in Edge) can discover and call. The page:
+
+- Reports **support status** for the running browser (`useWebMCP()`).
+- Registers **imperative tools** — a todo list backed by `add-todo`,
+  `list-todos` (`readOnlyHint`), and `clear-todos` (`destructiveHint`), each with
+  validated, capped input. Plain buttons perform the same actions so the UI is
+  verifiable without an agent.
+- Registers a **declarative tool** — the feedback form as `send-feedback` via
+  `<ToolForm>`, with auto-submit on by default and a toggle into human-in-the-loop
+  review mode that exercises the package's lifecycle safety (visual indicators,
+  a pending banner with a channel-safe cancel, a 60s stale-invocation watchdog,
+  and reset-after-submit).
+- Streams an **invocation log** (hard-capped at 50 entries) and enables verbose
+  **diagnostics** so registration failures, validation rejections, overlapping
+  invocations, and watchdog cancellations all surface instead of failing
+  silently.
+
+Every `react-web-mcp` primitive is a safe no-op when `document.modelContext` /
+`navigator.modelContext` is missing, so the page (and the app) is unaffected in
+browsers without WebMCP; the buttons and form still exercise the same code paths.
+
+## Code-health trackers
+
+Two living Markdown documents track code health and are updated as work lands.
+
+### Untested-code tracker
+
+`docs/untested-code-tracker.md` tracks high-impact untested areas of `src/lib`
+(overall coverage ~31%, target >75%). It carries a per-folder coverage snapshot,
+a ranked **"Top 10 highest-ROI to test next"** checklist, tiered backlog sections
+(money/auth/data integrity, cloud provisioning, agent orchestration, chat client
++ utilities), and an explicit **skip list** for low-ROI code (thin SDK wrappers,
+string constants, DOM-bound hooks, pure UI). It also indexes the LLM/agent
+**integration tests** (`.integration.test.ts`) that run against real provider
+APIs and auto-skip when the relevant key is absent. Tick a box when you add a
+test, add new high-impact untested code to the relevant tier, and refresh the
+snapshot by re-running `pnpm test:coverage` periodically.
+
+### Dead-code tracker
+
+`docs/dead-code-tracker.md` records unused, commented-out, or otherwise dead code
+— unused variables and imports, commented-out JSX/CSS/props, and fragile inline
+TODOs that should become issues. Each entry names the file, line, and fix so it
+can be cleared quickly.
+
+## Content validators
+
+Two AST/string validators run inside the write path so the agent cannot ship a
+guaranteed runtime break. They are conservative by design — they only fire when
+they can prove a problem, so they never wedge a legitimate change.
+
+- **React child-component validation** —
+  `validateReactChildComponent(code)` flags a component object (a `lucide-react`
+  icon, or a local `forwardRef`/`memo` binding) rendered directly in JSX child
+  position (`{Home}` instead of `<Home />`), which crashes with the minified
+  React error #31 ("Objects are not valid as a React child"). It follows JS
+  evaluation semantics for ternaries, `&&`/`||`/`??`, and arrays, and never
+  flags correct elements, prop values (`icon={Home}`), or member/call
+  expressions it cannot prove. It is blocking in both write paths.
+
+- **Edge-function column validation** — before the edge-function agent deploys a
+  Supabase function, a `validate_table_name` tool surfaces each table's real
+  columns, and a deterministic deploy gate (`extractSupabaseColumnRefs` +
+  `detectUnknownColumns`) rejects any query that references a column provably
+  absent from the table's schema, with a Levenshtein "did you mean" suggestion.
+  It is literal-only, known-tables-only, and fail-open, so it blocks only when
+  certain.
+
+## reactDoctor diagnostics ruleset
+
+reactDoctor is Genie's lint/diagnostics ruleset for the generated React/Next.js
+apps — it powers the code-quality checks. Each rule is stored as a `.txt` report
+under `docs/reactDoctor/` (rule name, severity, category, a count, a suggested
+fix, and the offending files), and the full machine-readable output lives in
+`diagnostics.json`. Rather than enumerate every rule, the categories are:
+
+| Category                     | What it covers                                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Accessibility (`jsx-a11y`)   | Interactive-element semantics, labels, redundant roles, autofocus, keyboard events for click handlers.  |
+| Performance & re-render      | JS hot-path optimizations (Set/Map lookups, index maps, combined iterations), memo/reducer hints, and async patterns (no await-in-loop, parallelize). |
+| State & effects              | No fetch in effect, effect cleanup, no derived state via effect/`useState`, no cascading `setState`, prefer `useEffectEvent`. |
+| Rendering & hydration        | Hydration-mismatch and no-flicker guards, conditional-render pitfalls, script defer/async, SVG precision. |
+| Next.js                      | Framework idioms: use `next/image`/`next/link`/`next/script`, image `sizes`, Suspense around `useSearchParams`, no client-side redirect. |
+| Design                       | Visual/copy conventions: no default Tailwind palette, no bold-only headings, no gradient/pure-black, no em-dash or three-period ellipsis in JSX text, redundant spacing axes. |
+| React correctness            | No `dangerouslySetInnerHTML`, no unknown DOM props, no array index as key, no secrets in client code, no deprecated React 19 APIs. |
+| Dead code (`knip`)           | Unused files, exports, types, and duplicate exports flagged by knip.                                    |
+
+Use these reports to prioritize cleanup: high counts and the accessibility,
+state-and-effects, and dead-code categories tend to be the highest-signal.
+
+## Where to start
+
+- Reproduce a stuck pipeline card without a real turn: `/test/pipeline-view`.
+- Exercise WebMCP tools and their lifecycle safety: `/test/webmcp`.
+- Find your next test to write: `docs/untested-code-tracker.md`.
+- Clear low-hanging cleanup: `docs/dead-code-tracker.md` and the
+  `docs/reactDoctor/` reports.

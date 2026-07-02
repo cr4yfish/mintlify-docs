@@ -1,0 +1,228 @@
+---
+title: "Security and compliance"
+description: "How Genie protects your data with row-level security, PII detection, authenticated edge functions, supply-chain controls, and recovery, backed by an ISO 27001-aligned compliance program."
+---
+
+Genie builds apps for you with an AI agent, so it handles your source code,
+cloud credentials, and customer data on your behalf. Security is engineered into
+the platform rather than bolted on: authorization lives in the database, secrets
+are encrypted at rest, generated code is scanned before it ships, and every
+control traces back to a written policy in an ISO 27001-aligned compliance
+program.
+
+This page summarizes the security features you get by default and the compliance
+program that governs them.
+
+## Security features
+
+### Row-level security is the primary boundary
+
+Genie enforces authorization **inside Postgres**, not only in application code.
+Every database query runs in a transaction that first sets
+`app.current_user_id`, and per-table row-level security (RLS) policies decide
+what that user may read or write.
+
+Application-layer filters (`WHERE owner = ...`) are treated as defense in depth,
+never as the authorization itself. The point is fault tolerance: a forgotten
+predicate or a query-builder bug returns *no rows* rather than rows from the
+wrong tenant. A single wrapper (`transaction({ userId })`) is the only path to
+the database, and the rare service work that must bypass RLS goes through an
+explicit, greppable, reviewable `skipAuthCheck` flag that the security code
+owners gate in review.
+
+### PII detection
+
+Genie ships a heuristic PII detector that statically scans arbitrary strings for
+personally identifiable information — emails, credit cards, IBANs, national
+insurance numbers, API keys and cloud credentials, private-key blocks, and more.
+It runs entirely offline using regular expressions plus cheap deterministic
+checksums (Luhn, IBAN mod-97), so detection is fast and never sends your text to
+another service.
+
+Each string is classified as `clean`, `maybe-pii`, or `pii`, and every match is
+reported with a rule id, a category label, a confidence, a severity, and a
+**redacted** form that is safe to log — the raw matched value is never
+serialized.
+
+<Note>
+The detector is best-effort, not a compliance guarantee. Free-form PII such as
+names and postal addresses is intentionally out of scope because it cannot be
+detected reliably from patterns alone.
+</Note>
+
+#### Workspace PII rules
+
+Each workspace configures its own detection policy on the **PII Detection**
+settings page. Owners and admins can:
+
+- Toggle any built-in detector on or off.
+- Author custom regex rules for domain-specific identifiers.
+- Set an **action** per rule — `ignore` (detect only), `log` (write a censored
+  entry to the detection log), or `block` (reject the content, also logged).
+
+Rules are stored in Postgres, scoped to the workspace, and protected by RLS:
+any member may read them, but only an owner or admin may change them. The
+enforcement points — both the workspace chat and project chat routes — scan the
+last user message before doing any expensive work, return `403` with the matched
+categories when a `block` rule fires, and **fail open** if the scan itself errors
+so a fault in the PII system never wedges chat. Custom patterns are compiled
+through a single trusted compiler that length-caps the input (mitigating ReDoS),
+allows only a safe set of flags, and rejects invalid syntax before any write.
+
+The append-only detection log stores only the **censored** match (for example
+`jo********om`), never the raw value, alongside who triggered it and from which
+surface. Because everything in a workspace must be reachable by Genie AI, the
+chat agent can list, create, edit, delete, and reset PII rules on your behalf —
+subject to the same owner/admin checks — and is instructed to confirm before
+disabling a detector or weakening a `block` action.
+
+### Authenticated edge functions
+
+When the agent generates a Supabase edge function for your project, it can
+require authentication by flipping a single flag. Genie does not rely on the
+legacy gateway-level `verify_jwt` switch; instead it enforces auth **in the
+function code** through one canonical, audited guard that verifies the caller's
+Supabase JWT with `auth.getUser()`.
+
+A deterministic deploy gate refuses to ship an authenticated function unless the
+source actually carries the guard marker, invokes the guard, and wires its `401`
+rejection correctly — so an authenticated function can never deploy without
+working auth. Public webhooks and crons opt out per function; there is no global
+kill switch that could silently drop auth everywhere. The admin **auth-guards**
+console inventories every guarded function, flags any whose guard version is
+stale, and can redeploy fixes across the fleet.
+
+### The security page
+
+The public `/security` page explains how Genie approaches security and data
+privacy while building an agentic coding product. It leans into Genie's German
+data-privacy heritage ("made in Hamburg") and walks through the modern AI-era
+attack vectors Genie defends against:
+
+- **Prompt injection via web crawling** — content fetched from the web is
+  quarantined as data before it reaches the agent, and every fetched page is
+  scanned by a continuously trained detector.
+- **Weak AI-coded security** — every generated change is scanned, and auth plus
+  row-level security are wired in by default.
+- **Supply-chain attacks** — dependencies are pinned, version-locked, and vetted
+  against vulnerability and malware databases.
+
+### Supply-chain security
+
+The agent pulls third-party code from external registries when it generates your
+project (`esm.sh` URL imports for React/Vite source, `npm:` specifiers for edge
+functions). Genie treats those registries as untrusted suppliers and enforces
+hygiene in code:
+
+- **Pinned versions only.** A validator rejects any import that lacks an explicit
+  `@version`, so a future malicious publish can never land silently on a rebuild.
+- **Single resolution chokepoint.** Every package flows through one resolver
+  tool gated by a static blocklist, a name-plausibility check (catching
+  typosquats and homoglyphs), and a **72-hour minimum-age** gate — the single
+  highest-value control against hijacked publishes, which are usually yanked
+  within a day.
+- **Integrity checks.** Genie records the SHA-256 of each resolved response and
+  compares it on every later resolution of the same pinned version; a mismatch
+  fails the resolution and raises a flag.
+- **Blast-radius tracking.** Every package occurrence is appended to a per-save
+  inventory, so during an upstream incident a single query enumerates every
+  project, file, and line that shipped the compromised version.
+- **Leak prevention in generated code.** An AST taint analysis refuses to deploy
+  any edge function that would return a non-public `Deno.env` secret to the
+  client.
+
+An `/admin/packages` dashboard surfaces new, first-time, and risk-flagged
+packages, and the controls are walked every quarter (see the compliance program
+below).
+
+### Rollback and recovery
+
+The **Rollback to this state** button reverts a project to a
+previously-deployed version in one click. The flow has three side effects —
+restore the code in S3, re-anchor the code graph, and kick off a fresh build —
+wrapped in a durable workflow so a host crash or a transient cloud hiccup never
+leaves a project half-rolled-back. The runtime retries failed steps, persists
+state across crashes, and exposes run status to any caller. Each rollback creates
+a *new* deployment that points at the version it restored, keeping a clean audit
+trail.
+
+At the platform level, recovery is backed by Aurora point-in-time recovery
+retained for 35 days. Restoring a backup taken before a data-deletion event must
+be followed by a re-run of the deletion job so erased data is not silently
+re-created.
+
+## Compliance program
+
+Genie runs an Information Security Management System (ISMS) aligned to
+**ISO/IEC 27001:2022**. The program is documented as an auditor-ready evidence
+pack: every policy points at the code, configuration, or runtime control that
+implements it, so each Annex A control traces policy → control → evidence.
+
+### Policy set
+
+<table>
+<thead>
+<tr><th>Policy</th><th>What it covers</th></tr>
+</thead>
+<tbody>
+<tr><td>Information security policy</td><td>Management commitment, ISMS scope, objectives (confidentiality, integrity, availability, compliance), and roles.</td></tr>
+<tr><td>Access control policy</td><td>Auth0 OIDC identity, Postgres RLS as the primary authorization boundary, least privilege, and joiner/leaver handling.</td></tr>
+<tr><td>Cryptography policy</td><td>Algorithms in use (libsodium `secretbox` at rest, TLS 1.2+ in transit, RS256 JWTs), versioned keys, and rotation cadence.</td></tr>
+<tr><td>Data retention and deletion policy</td><td>Retention windows per data category, GDPR-compliant account erasure, audit-log anonymization, and data subject rights.</td></tr>
+<tr><td>Logging and monitoring policy</td><td>OpenTelemetry traces, the append-only workspace activity log, what is deliberately not logged, and alert routing.</td></tr>
+<tr><td>Incident response plan</td><td>Severity matrix, the detect → notify → post-mortem lifecycle, the 72-hour breach-notification target, and a supply-chain runbook.</td></tr>
+<tr><td>Change management policy</td><td>How a change reaches production: reviewed, signed, gate-checked pull requests; separation of duties; and dependency updates.</td></tr>
+<tr><td>Supplier management</td><td>The subprocessor register, DPAs, onboarding review, and the annual vendor review.</td></tr>
+<tr><td>Supply-chain quarterly review</td><td>The quarterly checklist and review log for the AI-generated-code supply-chain controls.</td></tr>
+<tr><td>Risk register</td><td>Scored risks (likelihood × impact) with a treatment and owner for each; risks scoring ≥ 12 require an active treatment.</td></tr>
+</tbody>
+</table>
+
+### Statement of Applicability and Annex A mapping
+
+The **Statement of Applicability (SoA)** declares every ISO 27001:2022 Annex A
+control as Applicable or Not Applicable with a justification. The vast majority
+are Applicable; the physical controls (Annex A.7) are inherited from
+subprocessors (AWS, Cloudflare, Supabase, Vercel) and evidenced by their SOC 2
+and ISO 27001 reports.
+
+The **Annex A mapping** is the auditor's navigation aid: for each Applicable
+control it links the governing policy to the implementing code path or workflow
+— for example, access control (5.15, 8.3) maps to the RLS transaction wrapper,
+cryptography (8.24) to the secret-box implementation and its tests, and logging
+(8.15) to the OpenTelemetry setup and the append-only activity log.
+
+### Risk register
+
+Risks are scored on likelihood × impact (each 1–5) and reviewed quarterly. Every
+entry names a treatment, an owner, and a status. Representative risks include
+authorization bypass (mitigated by RLS plus integration tests and code-owner
+gating), a leaked secret (GitHub secret scanning and push protection), encryption
+key compromise (versioned keys enabling zero-downtime rotation), and a
+compromised external package landing in a generated project (the supply-chain
+controls above). Accepted risks are documented transparently rather than hidden.
+
+### Incident response
+
+Incidents are classified SEV-1 to SEV-3 and move through a fixed lifecycle:
+detect, triage (a severity assigned within 30 minutes), contain, eradicate,
+recover, notify, and post-mortem. Detection draws on multiple sources —
+application traces, Auth0 anomaly alerts, Cloudflare WAF, AWS GuardDuty,
+dependency-audit CI, and vulnerability reports to a monitored disclosure inbox.
+SEV-1 customer notification targets **72 hours** from confirmation to meet GDPR
+Article 33, blameless post-mortems are mandatory for SEV-1 and SEV-2, and a
+SEV-1 tabletop is run at least annually. A dedicated branch runbook covers a
+compromised external package: block it, short-circuit the resolver, enumerate the
+blast radius, and contain.
+
+### Supplier management
+
+Genie maintains a subprocessor register listing every third party that processes
+data on your behalf — Auth0, Stripe, Supabase, AWS, Cloudflare, Anthropic,
+Vercel, Braintrust, and GitHub — with the purpose, data categories, DPA status,
+and each supplier's compliance posture (SOC 2, ISO 27001, PCI DSS). Genie uses
+only attested suppliers, requires a security review and a signed DPA before
+onboarding a new one, and re-reviews the register annually. The external package
+registries the agent pulls from are listed as software supply-chain suppliers;
+they process no customer data, so their entries focus on code-integrity controls
+rather than DPAs.

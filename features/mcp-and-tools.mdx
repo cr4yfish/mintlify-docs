@@ -1,0 +1,227 @@
+---
+title: "MCP & agent tools"
+description: "How Genie exposes its MCP server, WebMCP tools, and the secure-action and user-action tools its chat agent uses to act on your behalf."
+---
+
+Genie is scriptable from the outside and agentic on the inside. The same
+workspace and project operations you perform in the web app are also available
+to AI clients over a **Model Context Protocol (MCP) server**, to in-browser
+agents through **WebMCP**, and to Genie's own **workspace chat agent** through a
+catalog of **secure-action** and **user-action** tools. This page maps out those
+surfaces and how they fit together.
+
+## The Genie MCP server
+
+Genie hosts its own MCP server so external AI clients — Claude Desktop, Cursor,
+or a custom agent — can manage workspaces and projects programmatically.
+
+### Connecting
+
+- **Endpoint:** `https://www.genie-app.de/api/mcp`
+- **Transport:** Streamable HTTP (`POST`, `GET`, `DELETE` on the same URL).
+  Sessions are stateless — no persistent connection required.
+- **Auth:** OAuth 2.0 with PKCE, scoped to a single workspace. The flow issues a
+  short-lived JWT carrying the caller's user ID and the authorized workspace;
+  every request presents it as `Authorization: Bearer <jwt>`. OAuth endpoints
+  live under `/api/mcp/oauth/`.
+
+Each tool is defined server-side as an `McpToolDefinition` (`name`,
+`description`, a Zod `inputSchema`, an async `handler`, and an optional App UI
+resource) collected in `mcpTools`. Handlers run with full server-side access
+(database queries, internal APIs) but strip sensitive fields — MCP server rows,
+for example, are returned through a summary type that omits stored credentials.
+
+### What it exposes
+
+The server covers read and write parity with the web app across workspaces,
+projects, Genie Cloud backends, secrets, scheduled jobs, and PII rules. A
+representative slice:
+
+| Category | Notable tools |
+|---|---|
+| Workspace | `list_workspaces`, `get_workspace_info`, `create_workspace`, `update_workspace_settings`, `get_workspace_billing`, `get_credit_usage`, `get_workspace_credits` |
+| Members & invites | `list_workspace_members`, `invite_workspace_member`, `invite_workspace_member_by_email`, `revoke_workspace_invite`, `update_workspace_member_role`, `remove_workspace_member` |
+| Workspace MCP integrations | `list_workspace_mcp_servers`, `add_workspace_mcp_server`, `update_workspace_mcp_server`, `toggle_workspace_mcp_server`, `delete_workspace_mcp_server`, `test_workspace_mcp_server_connection` |
+| Projects | `list_latest_projects`, `search_projects`, `get_project`, `create_project`, `update_project`, `rename_project`, `archive_project` / `unarchive_project`, `delete_project`, `add_project_to_workspace`, `remove_project_from_workspace` |
+| Builds | `send_followup_prompt`, `get_project_status`, `get_project_deployment_status`, `get_project_deployment_plan`, `abort_project_build`, `suggest_project_prompts`, `show_preview`, `get_auto_mode_state`, `set_auto_mode` |
+| Genie Cloud backend | `get_project_cloud_settings`, `add_project_role` / `delete_project_role`, `assign_project_role`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_project_users` |
+| Project secrets | `list_project_secrets`, `set_project_secret`, `delete_project_secret` |
+| Scheduled jobs (cron) | `list_scheduled_jobs`, `schedule_job`, `unschedule_job`, `run_scheduled_job_now` |
+| Workspace chat | `send_workspace_chat`, `create_workspace_chat`, `list_workspace_chats`, `search_workspace_chats`, `rename_workspace_chat`, `delete_workspace_chat` |
+| Code graph | `query_project_code_graph` |
+| PII rules | `list_workspace_pii_rules`, `set_workspace_pii_rule`, `create_workspace_pii_rule`, `list_workspace_pii_detections`, `reset_workspace_pii_rules` |
+| Pricing | `get_genie_pricing` (live from Stripe, with a static fallback) |
+
+<Note>
+  Write and destructive tools enforce workspace role hierarchy (owner / admin /
+  member / editor) and, where irreversible, require an explicit confirmation
+  flag such as `confirm_delete: true`.
+</Note>
+
+### Project & scheduled-job management
+
+Two areas are worth calling out because they let an external agent drive real
+build and backend work, not just read state:
+
+- **Project builds.** `create_project` provisions a project from a
+  natural-language prompt, fires the first build turn, and returns immediately
+  with the deployment URL while the build continues server-side.
+  `send_followup_prompt` sends further prompts into an existing project's chat
+  pipeline. Poll progress with `get_project_status` (lightweight) or
+  `get_project_deployment_status` (full per-phase breakdown: `sum`, `thinking`,
+  `coding`, `deploying`, `finished`, `error`, and so on), and stop a run with
+  `abort_project_build`.
+- **Scheduled jobs (cron).** A project can run a **deployed edge function** on a
+  timer. `schedule_job` creates or updates a schedule (idempotent by job name,
+  with a 5-field cron expression and optional IANA timezone), `list_scheduled_jobs`
+  reports each job's next-run schedule plus the real HTTP outcome of its last
+  run, `unschedule_job` removes one, and `run_scheduled_job_now` fires it once to
+  verify it without touching the schedule.
+
+The `send_workspace_chat` / `create_workspace_chat` tools are a bridge back into
+Genie's own agent: they run the **full Genie workspace assistant** (the same
+agent as the web app), which can itself call tools to look up projects, members,
+billing, and pricing, and persist the exchange to workspace chat history.
+
+## WebMCP project tools
+
+The project chat page also exposes Genie to **in-browser AI agents** — Gemini in
+Chrome, Copilot in Edge, or the DevTools WebMCP panel — via the
+[WebMCP](https://developer.chrome.com/docs/ai/webmcp) web standard, using
+Genie's own `@cr4yfish/react-web-mcp` bindings. An agent driving the browser can
+prompt Genie and read the answer without clicking through the UI.
+
+The page registers two tools from a headless client component (it renders
+nothing, registers on mount, unregisters on navigation):
+
+| Tool | Purpose |
+|---|---|
+| `send-prompt` | Sends a prompt to Genie in the open project's chat, exactly like the user typing. Validated (1–10,000 chars) and routed through the same guarded sender the autofix flow uses. Returns immediately — Genie processes asynchronously — and refuses with an `isError` response when the prompt is invalid, Genie is busy, or another user holds the edit lock. |
+| `get-genie-status` | Read-only JSON snapshot for polling: `isBusy`, `genieStatus`, `chatStreamStatus`, `isLockedByOtherUser`, and a `latestAssistantResponse` excerpt (hard-capped at 2,000 chars). Annotated `readOnlyHint` + `untrustedContentHint` so agents treat the excerpt as data, not instructions. |
+
+The intended loop: `get-genie-status` → wait until `isBusy` is `false` →
+`send-prompt` → poll again until idle → read `latestAssistantResponse`. In
+browsers without WebMCP every primitive is a safe no-op, so the page is
+unaffected. The package's own primitives (imperative and declarative tools,
+lifecycle safety, diagnostics) are exercised in isolation on `/test/webmcp`.
+
+## Secure-action tools
+
+The workspace chat agent (Genie AI) acts on your behalf, but state-mutating
+actions can't safely route a captured value back through the model — a secret
+typed into a generic input would land in the transcript in plaintext, and a
+"Saved." message would be a lie because nothing was persisted. **Secure-action
+tools** solve this: each is a focused tool with a dedicated confirmation card
+and a fixed server endpoint.
+
+Every secure action shares one lifecycle:
+
+1. The tool is defined server-side with an `inputSchema` **but no `execute`** —
+   the browser resolves it.
+2. A client renderer (a registry maps tool name → card) captures the user's
+   confirmation, then calls the matching `"use server"` action directly (which
+   already does auth via `requireOwnedProject`, validation, and the write).
+3. The card calls `addToolOutput` with **only sanitized metadata** — for a
+   secret, `{ ok: true, saved: true, projectId, name }`, never the value.
+
+Renderers validate that the targeted `projectId` / `workspaceId` matches the
+chat's current context before writing, and most actions stamp `source: "chat"`
+into the workspace activity log. The catalog spans project, workspace, member,
+and billing operations:
+
+| Group | Example tools |
+|---|---|
+| Secrets | `save_project_secret`, `delete_project_secret` (Genie-provided defaults are protected) |
+| Project details & lifecycle | `update_project_details`, `create_project`, `send_project_prompt`, `archive_project` / `unarchive_project`, `cancel_project_deletion`, `add_project_to_workspace`, `remove_project_from_workspace` |
+| Roles & access (Genie Cloud) | `add_project_role`, `delete_project_role`, `assign_project_role`, `remove_project_role`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_app_users` |
+| Project membership | `add_project_member`, `remove_project_member` (only meaningful with `project_access_control` on) |
+| Workspace members & invites | `invite_workspace_member`, `add_workspace_member_by_email`, `remove_workspace_member`, `update_workspace_member_role`, `revoke_workspace_invitation` |
+| Workspace settings | `toggle_workspace_setting` |
+| Workspace MCP integrations | `add_workspace_mcp_server`, `update_workspace_mcp_server`, `toggle_workspace_mcp_server`, `remove_workspace_mcp_server`, `test_workspace_mcp_server_connection` |
+| Billing / external flows | `upgrade_workspace_plan`, `update_workspace_seats`, `cancel_subscription`, `connect_mcp_oauth` |
+| Read helpers | `get_project_cloud_settings`, `list_workspace_members`, `list_workspace_invitations`, `list_workspace_activity`, `list_workspace_mcp_servers` |
+
+<Warning>
+  Cards render inside the command-palette dialog, where a native `<form>` submit
+  reloads the page even with `preventDefault()`. Interactive cards drive submit
+  through a `<Button type="button" onClick>` plus an `Enter` key handler —
+  never a `<form>` / `type="submit"` pair.
+</Warning>
+
+The read helpers aren't secure actions in the strict sense (they have `execute`
+and run server-side), but they belong in the catalog: the mutation tools can't
+be used safely without first resolving real member IDs, role names, or MCP
+server state. Credential-bearing inputs — bearer tokens, secret values — are
+POSTed straight to the server from the card and never reach the model.
+
+## User-action tools
+
+For nudges and disambiguation that don't mutate server state, the agent renders
+inline interactive controls via the `request_user_*` family. All are
+client-resolved (no `execute`); the browser renders the card and calls
+`addToolOutput` once the user acts.
+
+| Tool | Renders | Output |
+|---|---|---|
+| `request_user_button` | A one-shot trigger button | `{ clicked }` |
+| `request_user_input` | A single-line text or password field | `{ submitted, value }` |
+| `request_user_link` | A navigation button to an internal route (must start with `/`, no external URLs) | `{ opened, href }` |
+| `request_user_select` | A single-choice radio group | `{ selected, value, label }` |
+| `request_user_textarea` | A resizable multi-line field | `{ submitted, value }` |
+| `request_user_checkbox` | A checklist plus an always-present free-text note field | `{ selected, values, labels, note }` |
+
+Card text (labels, descriptions, placeholders) is authored by the model per
+call and localized through the agent's response-language prompt block rather than
+next-intl. Because the model writes it live, any leaked template token (e.g. an
+unfilled `{name}`) is scrubbed by `resolvePlaceholders` at render time and
+resolved again server-side before the transcript is persisted.
+
+<Note>
+  `request_user_input` must never be used for secrets — the plaintext value
+  lands in the chat transcript. Use `save_project_secret` (a secure action)
+  instead, which POSTs the value directly to the server.
+</Note>
+
+## How the workspace chat agent invokes tools
+
+The agent mixes all three families in a single turn. When it needs input, it
+calls a client tool (a `request_user_*` card or the relocatable `create_project`
+secure action), which **blocks the turn** until the user responds — the response
+returns browser-side via `addToolOutput` and the next turn proceeds.
+
+Where a pending card renders depends on viewport and conversation depth
+(centralized in `useActiveClientToolPlacement`):
+
+- **Desktop, opening turn** — inline in the transcript; the prompt input stays
+  available.
+- **Desktop, later turns** — the card takes over the composer slot at the bottom
+  so a pending action can't scroll out of sight.
+- **Mobile** — always an auto-opening, non-gesture-dismissible bottom-sheet
+  drawer; it closes only through the card's own Cancel / ✕, and dismissing it
+  emits a `dismissed` output so the agent's turn never hangs.
+
+Only the newest active client tool is surfaced. Once resolved, the card collapses
+to a one-line summary pill, and the resolved output is reconciled back onto the
+stored message so it stays resolved across reloads.
+
+Workspace-scoped MCP integrations are threaded in separately. On a build
+follow-up, the tech-lead and scoped code agents load two discovery meta-tools —
+`search_mcp_tools` and `call_mcp_tool` — and invoke namespaced tools
+(e.g. `stripe___create_product`) on demand; on a chat-mode turn the genie agent
+loads the real namespaced tools directly for read-only Q&A. The first scaffold
+turn deliberately loads no MCP tools, and every opened transport is closed at
+end-of-stream.
+
+## Testing & verifying
+
+- `/test/webmcp` — exercises the WebMCP package primitives (imperative todo
+  tools, declarative feedback form, lifecycle diagnostics) with and without a
+  WebMCP-capable browser.
+- `/test/workspace-chat-active-tool` — drives the real conversation + composer to
+  make any client tool pending, including `create_project`; resize below 768px to
+  exercise the mobile drawer. Includes a **Copy debug JSON** button.
+- `/test/user-action-placeholders` — previews every `request_user_*` card,
+  the placeholder scrubber's edge cases, long-label overflow, and resolved
+  states at desktop and mobile widths.
+- `/test/cron` and the admin monitor at `/admin/cloud/cron` — exercise scheduled
+  jobs across every data state, with run-now, unschedule, and secret rotation.

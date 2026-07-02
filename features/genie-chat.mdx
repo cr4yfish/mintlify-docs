@@ -1,0 +1,201 @@
+---
+title: "Genie AI chat"
+description: "Chat with the Genie AI assistant to build and manage your apps, with streaming replies, tool calls, saved history, and project deep links."
+---
+
+Genie AI is the chat assistant that lives inside every workspace. It helps you
+build and manage your apps: answer questions, research your project and the
+Genie docs, create new projects, send follow-up prompts to existing ones, and
+edit workspace content on your behalf. It is the same assistant everywhere you
+reach it, so a conversation behaves identically no matter where it opened.
+
+## Where you reach it
+
+Genie AI is available from several entry points, all backed by the same durable
+runtime and the same conversation components:
+
+<Card title="Standalone chat page" icon="message">
+  `/workspace/<id>/chat` is the dedicated chat surface. It leads with your
+  recent chats and a search box, and opens fresh chats from the workspace
+  dashboard input.
+</Card>
+
+<Card title="Command palette" icon="command">
+  Press `Cmd/Ctrl+K` and pick **Ask Genie** to chat without leaving the page
+  you are on.
+</Card>
+
+<Card title="Project tab" icon="sidebar">
+  Inside a project, open the **Genie AI** panel next to the app preview
+  (desktop drawer or mobile tab) to keep the assistant beside your running app.
+</Card>
+
+Because all three share one durable backend, a turn you start in one place keeps
+running even if you close that surface, and you can pick it back up elsewhere.
+
+## The chat flow
+
+When you send a prompt, the turn moves through a fixed pipeline before the first
+token arrives (starting the run, preparing the turn, loading tools and context,
+then the model). Genie narrates that wait and then streams its reply.
+
+### Thinking phases
+
+Rather than a frozen spinner, the chat shows a phased "thinking" indicator that
+advances through a short timeline:
+
+| Phase | Appears at | Label |
+| --- | --- | --- |
+| `starting` | 0.0s | Connecting to Genie… |
+| `preparing` | 0.5s | Preparing your chat… |
+| `tools` | 1.4s | Loading tools and context… |
+| `thinking` | 2.6s | Genie is thinking… |
+
+The last phase is terminal: a longer turn simply holds on "thinking" and a
+faster turn paints fewer phases before real content replaces the indicator. The
+phase text is announced to screen readers via `aria-live`.
+
+<Note>
+  The standalone chat page and project builds also surface a richer
+  phase-by-phase loader (setup, optimizing, running, deploying, summarizing,
+  saving) so you can see exactly where a build turn is.
+</Note>
+
+### Streaming responses
+
+Genie's reply streams in token by token. The opening acknowledgement (a short
+greeting on follow-up turns) renders as soon as its first tokens arrive, and the
+closing summary — "what I built", "not built yet", Genie's recommendation, a
+to-do list, or a chat-mode answer with sources — fills into its structured cards
+as it streams rather than popping in all at once. Interactive controls in the
+summary stay disabled until the stream settles, so you never act on a
+half-written value.
+
+### Tool calls and labels
+
+While answering, Genie reaches for a shifting set of tools — workspace and
+project lookups, Genie-docs and web search, past-chat search, memory writes, and
+any connected workspace integrations. Each non-interactive tool call surfaces as
+one abstract, localized label with a loading, done, or error state:
+
+| Category | What it means |
+| --- | --- |
+| `docs` | Searching documentation |
+| `web` | Searching the web |
+| `workspace` | Checking workspace details |
+| `project` | Checking project details |
+| `history` | Searching past chats |
+| `memory` | Saving to memory |
+| `report` | Reporting an issue |
+| `generic` | Working (any unrecognized or integration tool) |
+
+The label deliberately says only abstractly what a tool is doing — never the raw
+tool name, inputs, or outputs. A newly connected integration still gets a
+sensible `generic` label without any code change.
+
+### Interactive tool cards
+
+Some tools need something from you mid-turn. The `request_user_*` family (button,
+input, link, select, textarea, checkbox) and secure actions (create a project,
+send a prompt, invite a member) render rich confirmation cards instead of a plain
+label. On desktop these appear inline for the opening turn and take over the
+prompt input on later turns, so a pending action can't scroll out of sight. On
+mobile they open in an auto-summoned drawer. Resolving or dismissing a card
+always emits an output so Genie's turn unblocks instead of hanging.
+
+## Conversation history and URL sync
+
+The standalone chat page leads with a **recent chats** list — the four freshest
+conversations, with a "Load more" button (hard-capped at 24) and a debounced
+search box across your titles and message text. Every data state is explicit:
+loading skeletons, an empty line, an error with a retry, and the list itself.
+
+<Steps>
+  <Step title="Start a chat">
+    The conversation id is minted on the client on your first send, so the URL
+    swaps to the saved-chat address immediately — before the reply begins
+    streaming.
+  </Step>
+  <Step title="Keep a durable link">
+    Each saved conversation lives at its own route segment,
+    `/workspace/<id>/chat/<conversationId>`. Refreshing or sharing that link
+    re-hydrates the exact transcript and the context it started in.
+  </Step>
+  <Step title="Switch between chats">
+    Opening another saved chat lands on its own segment and shows a loading
+    state, never a flash of the previous conversation's messages.
+  </Step>
+</Steps>
+
+Conversations are scoped to you, so a shared link degrades gracefully to a
+resume-error state for anyone else.
+
+## Project linking
+
+When Genie points you at a project — most often one it just created — the link
+carries the current conversation id. On arrival, the project page opens its
+Genie AI panel and resumes that exact thread, so a "build me a todo app" chat
+continues seamlessly inside the new project ("now add due dates"). The id is
+attached automatically by the link card, not written by the model, so it is
+correct every time and survives the slug-to-canonical redirect. The panel
+remounts per linked conversation, so a second hop resumes the freshly linked
+thread rather than a stale one.
+
+Genie can also send a follow-up prompt to an **existing** project via a
+confirmation card that shows the proposed prompt in an editable textarea —
+nothing sends until you confirm, and you can rewrite it first. The turn runs
+durably in the background, exactly like typing into the project's own prompt box.
+
+## The finish response and recommendations
+
+A build turn closes with a summary card, and a chat-mode turn closes with an
+answer plus a "sources used" badge. The summary can include:
+
+- **What I built** and **not built yet** sections.
+- **Genie's recommendation** — a "Version 2" card whose suggestions render as a
+  checkbox list (all ticked by default). Ticking a subset composes a fresh prompt
+  from just those bullets; the primary button inserts a ready-to-use Version 2
+  prompt into your chat input.
+- A **to-do list** you can check off, each item wired to an "Ask Genie" handoff.
+- On chat-mode turns, a **Continue with Genie AI** button that opens the
+  assistant seeded with your question and its answer so you can keep going with
+  full context.
+
+## Error states
+
+Predictable failures render dedicated explanation cards instead of a generic
+"Genie is taking a nap" message, each with a relevant action:
+
+| Situation | What you see | Action |
+| --- | --- | --- |
+| Genie busy (409) | A "still working" card | Force-ready and retry |
+| Signed out (401) | Not-authenticated card | Log in |
+| Out of credits (402) | No-credits card (notes the message wasn't sent) | Upgrade or top up, then resend |
+| Guest deploy limit (402) | Guest-limit card | Sign up |
+| Invalid request (400) | Invalid-request card | Reload or try again |
+| Network drop | Network-error card | Wake up (reload) |
+
+Typed application errors bypass the disconnect poller and render their card
+immediately, so the chat never silently goes idle on a recognized failure. If
+credits drain mid-stream, the error comes down the durable stream and closes the
+turn cleanly with the same no-credits card.
+
+## Everything is readable and editable by Genie
+
+Everything in a workspace is meant to be usable by the chat agent, not just by a
+human clicking through the UI. Genie has both read and write capabilities for
+workspace content: it can look up workspace and project details, read a project's
+message history, search past chats and the Genie docs, save to memory, create
+projects, send prompts to existing projects, and drive secure actions like
+inviting members or editing settings through confirmation cards.
+
+<Note>
+  This is a standing rule for the product: whenever workspace functionality is
+  added or changed, the corresponding read and write capabilities are exposed to
+  Genie AI, so you can always ask the assistant to view or edit that data on your
+  behalf.
+</Note>
+
+Read-only research tools (lookups, search) run without a confirmation, while
+anything that changes state routes through an interactive card that you confirm —
+and can edit — before it runs.
