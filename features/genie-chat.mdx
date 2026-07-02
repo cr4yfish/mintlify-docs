@@ -178,6 +178,15 @@ answer plus a "sources used" badge. The summary can include:
   assistant seeded with your question and its answer so you can keep going with
   full context.
 
+A chat-mode answer is never allowed to land empty. If the model's forced final
+delivery comes back blank (a whitespace-only message still parses and would
+otherwise settle the turn as a silent success), Genie treats it as a
+non-delivery and retries the finish step — one attempt plus up to two retries.
+The first attempt that returns a non-empty answer wins and overwrites the blank
+placeholder; if every attempt is still empty, the turn is marked **failed**
+rather than shipping a blank response. Tokens are summed across attempts, so the
+retry is billed on top of the wasted attempt rather than hiding it.
+
 ## Error states
 
 Predictable failures render dedicated explanation cards instead of a generic
