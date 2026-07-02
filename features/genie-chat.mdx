@@ -103,6 +103,17 @@ prompt input on later turns, so a pending action can't scroll out of sight. On
 mobile they open in an auto-summoned drawer. Resolving or dismissing a card
 always emits an output so Genie's turn unblocks instead of hanging.
 
+<Note>
+  Creating a project from chat spends real credits — it provisions the project
+  and immediately kicks off its opening build. So Genie only offers
+  `create_project` when your spending wallet holds **more than one whole credit**,
+  a stricter bar than sending a normal message (which needs at least one). Below
+  that, the create-project card refuses with a "not enough credits" state and
+  points you to top up or upgrade rather than minting a project that can't fund
+  its first build. The check is enforced server-side, so the confirmation card
+  only ever reflects the decision.
+</Note>
+
 ## Conversation history and URL sync
 
 The standalone chat page leads with a **recent chats** list — the four freshest
@@ -145,6 +156,12 @@ Genie can also send a follow-up prompt to an **existing** project via a
 confirmation card that shows the proposed prompt in an editable textarea —
 nothing sends until you confirm, and you can rewrite it first. The turn runs
 durably in the background, exactly like typing into the project's own prompt box.
+
+When Genie links you to a project you already have open, it skips the pointless
+reload: on desktop the in-project panel shows an "already on this page" note, and
+on mobile it switches you to that project's chat tab. Every other link — a
+different project, workspace settings, pricing — navigates normally, as does any
+link on the standalone chat page or in the command palette.
 
 ## The finish response and recommendations
 

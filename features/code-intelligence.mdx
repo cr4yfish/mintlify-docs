@@ -7,7 +7,8 @@ Genie builds apps from natural language, and to do that well it keeps a rich,
 living model of every project it touches. This page covers the systems behind
 that: the **code graph**, the **code explorer**, the **Palantir** analysis and
 consult surfaces, **dreaming** and root-cause analysis, **autofix triggers**,
-**next-prompt prediction**, and **user profiling and memory**.
+**next-prompt prediction**, **user profiling and memory**, and **AutoSkill**
+skills retrieval.
 
 <Note>
   Most of these are internal platform features. Some surface to you indirectly
@@ -275,3 +276,42 @@ bumps the existing row's hit count instead of inserting a copy. The top memories
 by recency are injected into a `<user-memories>` block. Use **traits** when you
 want a rigid taxonomy you can dashboard on, and **memories** for everything that
 doesn't fit one.
+
+## AutoSkill (skills retrieval)
+
+Skills are markdown prompts that keep Genie's coding agents consistent and stop
+them repeating past mistakes. AutoSkill is the retrieval layer that decides which
+skills an agent sees, so the library gets *more* useful as it grows rather than
+less.
+
+The older approach loaded skills by a fixed `get_skill` enum and dumped whole
+files into the prompt, leaving the agent to guess which topic was relevant. Every
+new skill widened that enum and inflated the prompt. AutoSkill replaces the
+guesswork with search:
+
+- **Auto-embed** — every skill is embedded (Voyage `voyage-3`, 1024-dim) and kept
+  in sync with its content by hash, so only changed skills are re-embedded.
+- **Auto-query** — before an agent runs, AutoSkill hybrid-ranks (semantic +
+  lexical) the task against the library and injects only the most relevant skills:
+  pointers and summaries for the shortlist (a constant size no matter how large
+  the library gets), plus the full content of the single best match inlined so the
+  obvious case needs no extra lookup.
+- **Monitor** — usage is tracked per run, and runs that matched no skill are
+  flagged as gaps — the signal for where a new skill is worth writing.
+
+The suggested-skills block is injected wherever an agent plans or codes:
+**tech-lead planning**, the **first-prompt scoped agent**, and the **workspace
+chat agent**. Cloud-only skills stay hidden from workspace-level agents. The
+legacy `get_skill` tool still works (now usage-tracked); AutoSkill augments it
+rather than replacing it.
+
+Everything is best-effort. With no embedding key, an empty library, or a database
+hiccup, auto-query simply returns nothing and the agent runs exactly as before.
+
+Admins manage and verify the system at **/admin/skills**: a catalog showing each
+skill's embed status, content drift, and usage counts; a **Test auto-query** panel
+that renders exactly which skills a given task would inject and the resulting
+prompt block (no telemetry recorded for tests); and a **Runs flagged for review**
+list, worst coverage first. Embeddings re-sync from that admin action, an
+admin-or-token API route, or a nightly cron that only re-embeds skills whose
+content changed.

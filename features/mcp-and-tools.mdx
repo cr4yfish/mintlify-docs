@@ -65,7 +65,10 @@ build and backend work, not just read state:
 
 - **Project builds.** `create_project` provisions a project from a
   natural-language prompt, fires the first build turn, and returns immediately
-  with the deployment URL while the build continues server-side.
+  with the deployment URL while the build continues server-side. Because a new
+  project immediately starts a credit-spending opening build, `create_project`
+  requires the caller's wallet to hold **more than one whole credit** (a stricter
+  bar than the per-message floor) and is refused server-side otherwise.
   `send_followup_prompt` sends further prompts into an existing project's chat
   pipeline. Poll progress with `get_project_status` (lightweight) or
   `get_project_deployment_status` (full per-phase breakdown: `sum`, `thinking`,
