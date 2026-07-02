@@ -114,6 +114,46 @@ always emits an output so Genie's turn unblocks instead of hanging.
   only ever reflects the decision.
 </Note>
 
+## Images and screenshots
+
+Genie handles two very different kinds of image, and never confuses them.
+
+### The screen it can already see
+
+Every chat turn automatically carries a screenshot of your current view as
+background context (your live view, a server capture of the page, or a fallback
+app view), injected as a hidden part. This is context **only** — Genie treats it
+as "here is what the user is looking at," never as something you asked it to
+build.
+
+So if you say *"build what's on the screenshot"* but forget to attach one, Genie
+does **not** build the auto-captured view. It recognizes that you meant to attach
+an image, skips the build, and replies (in your language) asking you to attach the
+screenshot and resend. Attach one and the same turn builds normally, treating your
+upload as the design reference. Every forwarded image is explicitly tagged
+`internal_context_screenshot` vs `user_provided_screenshot` for the downstream
+build agents so the distinction survives end to end.
+
+### Uploading your own images and videos
+
+You can also get your **own** assets into an app's `public/` folder, so the app
+can reference them at a root-relative URL like `/logo.png`:
+
+- **Drag an image into the project chat** and say "use this as the hero" — Genie's
+  `save_user_upload_to_project` tool moves it from the short-lived upload area
+  into the project's asset folder and hands the code step the exact reference URL,
+  so the freshly uploaded asset is visible to the build in the same turn.
+- **The workspace upload card** (`upload_project_assets`, also a command-palette
+  row) is a drag-and-drop zone with per-file status that lands images and videos
+  straight into a project's `public/`.
+
+Both routes go **browser → short-lived upload bucket → server-side copy → your
+code bucket**; the browser never touches the source-code bucket directly, which
+has no CORS rule by design. Uploads are validated before anything is signed —
+an image/video MIME allowlist (SVG is deliberately excluded), per-type size caps,
+and a max of 10 files per upload — and a single rejected file never sinks the rest
+of the batch.
+
 ## Conversation history and URL sync
 
 The standalone chat page leads with a **recent chats** list — the four freshest
@@ -186,6 +226,16 @@ The first attempt that returns a non-empty answer wins and overwrites the blank
 placeholder; if every attempt is still empty, the turn is marked **failed**
 rather than shipping a blank response. Tokens are summed across attempts, so the
 retry is billed on top of the wasted attempt rather than hiding it.
+
+<Note>
+  When a response finishes, the client plays a soft synthesized chime (a
+  two-note Web Audio tone — no audio file is shipped) so you know the result is
+  ready even if you switched tabs while it built. Because browsers block audio
+  outside a user gesture, the chime is "unlocked" on your send click and reuses a
+  single long-lived audio context; the one case it can't cover is a turn that
+  streams into a tab you never interacted with, such as an externally triggered
+  autofix. Audition it at `/test/sound`.
+</Note>
 
 ## Error states
 

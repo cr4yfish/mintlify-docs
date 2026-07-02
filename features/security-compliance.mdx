@@ -151,6 +151,25 @@ retained for 35 days. Restoring a backup taken before a data-deletion event must
 be followed by a re-run of the deletion job so erased data is not silently
 re-created.
 
+### Project deletion and data lifecycle
+
+The default project action is **archive** (reversible). Permanent deletion is a
+separate, explicit "Delete permanently" flow, because a project's data spans
+several stores — Postgres (messages, deployments, errors, members), DynamoDB
+(deploy status, plans, edit-lock state), and object storage — plus external
+services, and a naive `DELETE` would leave orphans.
+
+Destructive deletion therefore runs as a **durable workflow** rather than a
+single request: the server action only validates, de-dupes spam clicks, and
+starts the run, returning a run id. The workflow handles crash recovery,
+exponential-backoff retries, and a **7-day grace window** before data is
+irreversibly erased — so a deletion can be **cancelled** within that window
+(`cancel_project_deletion` is a first-class action, reachable by the Workspace
+Chat Agent), and its status is queryable. The per-user Genie Cloud shell is
+shared across a user's projects, so a project deletion only removes that
+project's mapping; the shell itself is torn down only when its last project goes
+away.
+
 ## Compliance program
 
 Genie runs an Information Security Management System (ISMS) aligned to
