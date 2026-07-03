@@ -197,6 +197,19 @@ confirmation card that shows the proposed prompt in an editable textarea —
 nothing sends until you confirm, and you can rewrite it first. The turn runs
 durably in the background, exactly like typing into the project's own prompt box.
 
+Every prompt Genie authors for a project build — the first prompt of a new
+project and follow-up prompts to existing ones — is written as **structured
+markdown, categorized under `##` section headers** (for example `## Features`,
+`## Design`, `## Data (Genie Cloud)`, `## Task`) instead of a single wall of
+prose. The build agent gets a brief it can parse into scoped work, and you get a
+draft you can actually skim and edit in the confirmation card. The headers are
+examples, not a fixed template — Genie picks whichever ones describe *this*
+project and only writes a section it has real content for, so a trivial "fix the
+typo on the start page" ask becomes just a `## Task` line. For existing projects
+the faithfulness rule is unchanged (Genie never adds scope you didn't ask for and
+never drops a detail you gave); only the *shape* became structured, replacing the
+old strict-verbatim formatting.
+
 When Genie links you to a project you already have open, it skips the pointless
 reload: on desktop the in-project panel shows an "already on this page" note, and
 on mobile it switches you to that project's chat tab. Every other link — a
@@ -217,6 +230,23 @@ answer plus a "sources used" badge. The summary can include:
 - On chat-mode turns, a **Continue with Genie AI** button that opens the
   assistant seeded with your question and its answer so you can keep going with
   full context.
+
+The **What I built** and **Not built** cards now render on a brand-new app's
+**first build**, not just on follow-up turns. Both cards had always been part of
+the finish contract, but the first-prompt finish tool never declared the two
+fields in its schema, so the model's summary was silently stripped and the cards
+never appeared on an app's opening build. They are now first-class on every turn
+(2–4 user-facing "what I built" bullets, an empty **Not built** when everything
+shipped), and a failed optimistic deploy honestly rewrites them rather than
+leaving an over-promising summary.
+
+When a build turn ends up producing **more than one** finish response — for
+example, a model that stops mid-build and gets rescued into wiring the app and
+summarizing — Genie renders the **most complete** card (the one carrying the most
+non-empty sections), not merely the last one. Selecting by content rather than
+recency stops a truncated late fragment from hiding the full summary, and the
+same part is the one a later optimistic-deploy revision rewrites, so the card you
+see and the card Genie edits are always the same.
 
 A chat-mode answer is never allowed to land empty. If the model's forced final
 delivery comes back blank (a whitespace-only message still parses and would

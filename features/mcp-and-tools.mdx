@@ -42,9 +42,9 @@ representative slice:
 | Workspace | `list_workspaces`, `get_workspace_info`, `create_workspace`, `update_workspace_settings`, `get_workspace_billing`, `get_credit_usage`, `get_workspace_credits` |
 | Members & invites | `list_workspace_members`, `invite_workspace_member`, `invite_workspace_member_by_email`, `revoke_workspace_invite`, `update_workspace_member_role`, `remove_workspace_member` |
 | Workspace MCP integrations | `list_workspace_mcp_servers`, `add_workspace_mcp_server`, `update_workspace_mcp_server`, `toggle_workspace_mcp_server`, `delete_workspace_mcp_server`, `test_workspace_mcp_server_connection` |
-| Projects | `list_latest_projects`, `search_projects`, `get_project`, `create_project`, `update_project`, `rename_project`, `archive_project` / `unarchive_project`, `delete_project`, `add_project_to_workspace`, `remove_project_from_workspace` |
-| Builds | `send_followup_prompt`, `get_project_status`, `get_project_deployment_status`, `get_project_deployment_plan`, `abort_project_build`, `suggest_project_prompts`, `show_preview`, `get_auto_mode_state`, `set_auto_mode` |
-| Genie Cloud backend | `get_project_cloud_settings`, `add_project_role` / `delete_project_role`, `assign_project_role`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_project_users` |
+| Projects | `list_latest_projects`, `search_projects`, `get_project`, `create_project`, `update_project`, `rename_project`, `archive_project` / `unarchive_project`, `delete_project`, `add_project_to_workspace`, `remove_project_from_workspace`, `get_project_seo_settings`, `update_project_seo_settings` |
+| Builds | `send_followup_prompt`, `get_project_status`, `get_project_deployment_status`, `get_project_deployment_plan`, `abort_project_build`, `suggest_project_prompts`, `show_preview`, `get_auto_mode_state`, `set_auto_mode`, `list_project_deployment_versions`, `rollback_project_deployment` |
+| Genie Cloud backend | `get_project_cloud_settings`, `add_project_role` / `delete_project_role`, `assign_project_role`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_project_users`, `list_project_cloud_functions`, `list_project_database_tables`, `get_project_database_table_preview`, `list_project_storage_files` |
 | Project secrets | `list_project_secrets`, `set_project_secret`, `delete_project_secret` |
 | Scheduled jobs (cron) | `list_scheduled_jobs`, `schedule_job`, `unschedule_job`, `run_scheduled_job_now` |
 | Workspace chat | `send_workspace_chat`, `create_workspace_chat`, `list_workspace_chats`, `search_workspace_chats`, `rename_workspace_chat`, `delete_workspace_chat` |
@@ -84,7 +84,96 @@ build and backend work, not just read state:
 The `send_workspace_chat` / `create_workspace_chat` tools are a bridge back into
 Genie's own agent: they run the **full Genie workspace assistant** (the same
 agent as the web app), which can itself call tools to look up projects, members,
-billing, and pricing, and persist the exchange to workspace chat history.
+billing, and pricing, and persist the exchange to workspace chat history. Pass
+`project_slug` on either tool to **ground the conversation in a specific
+project** — the same context the web app sets when workspace chat is opened from
+a project page. The slug is resolved within the connected workspace, the
+conversation is stored with `origin: "project"` and the resolved `projectId` (so
+it shows up correctly in the web app's chat history), and the agent is handed the
+project's name so it can tailor its answer. Omit `project_slug` for a
+workspace-wide conversation (the default).
+
+### Rollback, SEO, and read-only backend browsing
+
+A later parity pass closed the remaining gaps between the web app and the MCP
+server, always reusing the existing owner/workspace authorization helpers,
+validating caller-supplied identifiers against server-resolved lists before use,
+and capping unbounded reads:
+
+- **Build rollback.** `list_project_deployment_versions` returns the stored build
+  versions that can be restored, newest first. `rollback_project_deployment`
+  restores a version's code from storage and triggers a fresh build — mirroring
+  the pipeline UI's **Rollback** action. The `version` is validated against the
+  list server-side (an unknown value is rejected, never used to build a storage
+  path), it overwrites the project's current code, and it requires
+  `confirm_rollback: true`. It returns immediately; poll
+  `get_project_deployment_status` for progress.
+- **SEO settings.** `get_project_seo_settings` parses the project's deployed
+  `index.html` and returns title, meta description, canonical URL, Open Graph
+  image URL, and the noindex flag. `update_project_seo_settings` rewrites the
+  `<title>`, meta description, and matching Open Graph / Twitter tags and
+  redeploys — only title and description are persisted today (matching the web
+  app's SEO tab), so canonical/OG-image/noindex stay read-only over MCP.
+- **Read-only Genie Cloud browsing.** `list_project_cloud_functions` lists the
+  deployed Edge Functions (slug, status, version, JWT-verification flag,
+  last-updated). `list_project_database_tables` lists the public-schema
+  tables/views with column and approximate row counts, and
+  `get_project_database_table_preview` returns column definitions plus **up to 25
+  sample rows** for one named table (resolve the exact name from the list first).
+  `list_project_storage_files` browses storage buckets and folders, capped at 200
+  entries.
+
+<Note>
+  Some capabilities are **deliberately out of scope** for the MCP server. There
+  is no raw project-file editing or manual deploy trigger (`rollback_project_deployment`
+  is the safe, already-scoped "undo a bad build"), no raw build/CodeBuild logs
+  (they can leak secrets baked into build output — `get_project_deployment_status`
+  exposes phase/error summaries instead), no arbitrary SQL (the table preview is
+  a fixed, bounded read against a table the server already returned, never a
+  caller-supplied query), and no storage writes (browsing is read-only; use the
+  web app's storage tab).
+</Note>
+
+## Internal-docs MCP (Palantir-only)
+
+Genie's own product documentation is also exposed over MCP — but through a
+**scope-gated, admin-only** surface reachable exclusively by the internal
+GeniePalantir agent, never by ordinary connected clients. It replaces a
+never-reliable external private-docs integration: the repo's `docs/` folder is
+synced into Postgres and served as three tools on the same
+`/api/mcp` server, searchable via hybrid (vector + full-text) retrieval.
+
+| Tool | What it does |
+| --- | --- |
+| `search_internal_docs` | Hybrid search; returns top-N chunks with doc path, heading breadcrumb, and fused + per-arm relevance scores. |
+| `read_internal_doc` | One doc by repo-relative path; a bounded slice (default 30k chars) with `offset` paging. |
+| `list_internal_docs` | All synced docs (path + title) for browsing and path resolution. |
+
+Three layers keep the surface admin-only:
+
+1. **Scope-gated registration.** The three tools are only registered when the
+   verified JWT carries the `internal-docs` scope. The public OAuth flow never
+   mints any scope, so Claude Desktop, Cursor, and other connected clients can
+   never obtain such a token.
+2. **Self-minted service token.** The only issuer of a scoped token is the
+   loader called by the admin-gated GeniePalantir agent, which signs a
+   short-lived token server-side.
+3. **Defense in depth.** Every handler re-verifies the caller is an admin before
+   touching data, so even a leaked scoped token is useless.
+
+Palantir loads **both** docs surfaces in the same turn — the public product-docs
+MCP and these private internal-docs tools — under separate namespaces
+(`internal_docs__…` alongside the public `genie_docs__…`), each failing
+independently, so the agent always has at least the public docs.
+
+<Note>
+  The sync is content-hash gated and two-phase: a fast staging pass writes
+  changed docs into Postgres, then a **durable Workflow embeds one doc per step**
+  (Voyage `voyage-3` vectors + full-text), so a full re-embed can't time out.
+  It runs daily on a cron and on demand from the `/admin/internal-docs` panel
+  (with a **Sync now** button, live search probe, and **Copy debug JSON**).
+  Without an embedding key the lexical arm still answers.
+</Note>
 
 ## WebMCP project tools
 
