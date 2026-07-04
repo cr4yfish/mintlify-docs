@@ -246,6 +246,16 @@ be used safely without first resolving real member IDs, role names, or MCP
 server state. Credential-bearing inputs — bearer tokens, secret values — are
 POSTed straight to the server from the card and never reach the model.
 
+<Note>
+  When the chat agent authors a **build prompt** — the `firstPrompt` of
+  `create_project` or the `prompt` of `send_project_prompt` (including one
+  composed from a `suggest_next_prompts` suggestion) — it writes **structured
+  markdown**: a one-line goal statement followed by `##` sections (Features,
+  Design, Data, and so on) rather than a wall of prose. Both readers benefit —
+  the project's build agent parses it into scoped work, and you get a draft you
+  can actually skim and edit in the confirmation card's textarea before it runs.
+</Note>
+
 ## User-action tools
 
 For nudges and disambiguation that don't mutate server state, the agent renders

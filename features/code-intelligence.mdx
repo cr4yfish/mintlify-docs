@@ -140,11 +140,38 @@ different scopes.
 GeniePalantir is an **admin-only** chat agent that reads across the *entire*
 platform — every user, project, wallet, ledger entry, and activity record — to
 help admins find patterns without writing SQL. It runs as a bounded tool-loop
-agent (Sonnet, capped steps) whose read tools bypass RLS. It is **read-first**:
+agent (Sonnet, ~30 read tools) whose read tools bypass RLS. It is **read-first**:
 every answer is sourced from rows a tool actually returned, never invented. Admins
 ask questions like "which users started a project but never came back?" or "is
 there a pattern in who churns after their first deploy fails?" and get the pattern
 narrated back with the receipts inline.
+
+**A durable investigation, not a 60-second one.** GeniePalantir runs on a
+**durable Vercel Workflow** (the same architecture as the workspace chat agent),
+so a deep multi-tool investigation is no longer cut off by a serverless
+wall-clock. The route starts the workflow and returns a run id; the client
+streams the answer, and on a refresh, reopened tab, or dropped connection it
+**reconnects to the live run** instead of re-asking the question. The composer's
+**stop** button does a *real* server-side abort — generation genuinely stops
+(and stops burning tokens on the admin key), and the aborted turn is discarded so
+it never reappears on reload. Because the run has no wall-clock budget, the
+step cap exists only as a runaway guard (raised from 10 to **40**), giving a
+long "anchor → drill → correlate → cross-reference → propose fix" chain room to
+finish in one turn.
+
+**Two docs surfaces in one turn.** Alongside its platform-read tools,
+GeniePalantir loads both the public product-docs MCP (`genie_docs__…`) and the
+private, admin-only **internal-docs MCP** (`internal_docs__…`, see
+[MCP and tools](/features/mcp-and-tools#internal-docs-mcp-palantir-only)), so it
+can ground an answer in Genie's own engineering docs, not just the database.
+
+**It proposes its own fixes.** When an investigation surfaces a concrete gap in
+the platform, GeniePalantir can draft a **fix brief** and open a fix PR — and it
+carries a standing self-improvement instruction to propose such PRs for gaps in
+its *own* behavior. It can also read back the briefs it has already filed
+(`get_fix_brief` / `list_fix_briefs`), so a follow-up investigation builds on
+prior findings instead of starting cold. These writes are the pattern → PR
+pipeline that the dreaming pass (below) feeds into.
 
 ### consult_palantir (scoped, for every user)
 
@@ -170,8 +197,47 @@ The scope boundary is enforced in code, not by the model:
 **Dreaming** is Genie's nightly background self-improvement pass. The dreaming
 agent distills the last 24 hours of step traces (`step_failed`, `step_notes`,
 `step_blocking`) into a `dream_report`: a list of recurring tool/prompt failure
-patterns, each with a severity and a one-line suggested action. That tells you
-*what* keeps breaking.
+patterns, each with a severity and a suggested action. That tells you *what*
+keeps breaking.
+
+### It dreams over context, not just trace text
+
+The agent no longer reasons over a flat dump of trace strings — it is given the
+surrounding context in two layers before and while it writes the report:
+
+- **Predicted context (deterministic prefetch).** Before the model is called,
+  three parallel code-graph walks pre-load the neighbourhood the report will
+  most likely need: the **trigger prompts** (what the user was actually asking
+  for when the step failed), the **recent edit history** of the hottest files
+  involved, and the **known issues** from the last few reports (with their triage
+  state, so a recurrence is reported rather than duplicated). Every walk is
+  bounded (id lists chunked at 100, free text truncated) and failure-tolerant — a
+  broken source degrades to empty context, never a failed report.
+- **Research pass (bounded tool loop).** A short `generateText` loop (hard-capped
+  at 6 steps) can then actively *search* the traces and code graph — an ILIKE
+  search over up to 14 days of trace text (is this pattern new, recurring, or
+  long-running? does it span projects?), plus walks back to trigger prompts and
+  file edit history. It appends plain-text **research notes** to the report
+  prompt and never throws: any failure falls back to the prefetched context
+  alone.
+
+The report is also **re-aimed at the pattern → PR pipeline**: a `suggestedAction`
+must now be a concrete *platform-source* fix (a change to a tool, agent prompt,
+capability, or registry/skill that engineering can land as a PR), never "tell the
+user to…". That is what the GeniePalantir root-cause pass turns into a fix brief.
+
+### Reliability: retry on "no object generated"
+
+Both single-shot `generateObject` calls in the pipeline (the dreaming report and
+the chained Palantir root-cause pass) used to surface the AI SDK's
+`NoObjectGeneratedError` — a content/validation failure the SDK's `maxRetries`
+does **not** cover — as a bare, information-free error. A shared wrapper now
+**retries** that specific failure (up to 3 attempts with a short backoff; other
+errors like auth are re-thrown immediately) and, if it still can't get a valid
+object, reports **structured diagnostics** — the finish reason, token usage, the
+underlying parse/validation error, and a bounded preview of the raw text that
+failed — through the admin trigger endpoint and the Palantir tool result, so an
+operator sees *why* it failed instead of "no object generated".
 
 ### Root-cause pass
 
@@ -193,6 +259,29 @@ history). You can tick issues off from the admin dreaming page — with an optio
 resolution note and a per-report `N / M handled` count — or through GeniePalantir's
 `set_dream_issue_handled` tool. That write is internal and reversible, so, unlike
 opening a fix PR, it doesn't require an explicit confirm.
+
+## Agent model tracing
+
+Every LLM-backed agent records **which concrete model produced a turn**, in two
+places, so a build or answer can always be traced back to the exact model that
+made it:
+
+- **On the response.** The resolved model id is stamped onto the persisted
+  assistant message row (`message.model`, `workspace_chat_message.model`,
+  `genie_palantir_message.model`) and streamed in that message's metadata — so
+  after the fact you can tell which model answered.
+- **In every trace.** The model id rides in the agent's trace context
+  (`runtimeContext` for tool-loop agents, `experimental_telemetry.metadata` for
+  the durable scoped code agent), so Braintrust spans are filterable by **model**,
+  not just by agent.
+
+This covers the whole fleet — the Genie research agent, the Tech Lead's planning
+and structuring passes, the scoped coding agent (per step), the Genie Cloud
+database/edge/storage sub-agents, the Mistral Genie Cloud predictor, the
+workspace chat agent, and GeniePalantir. The value is exactly the string
+`resolveModelForAgent` returns, so it matches the model config admins set per
+agent (no migration was needed — the `model` columns already existed and are now
+simply populated).
 
 ## Autofix triggers
 
