@@ -61,6 +61,32 @@ phase text is announced to screen readers via `aria-live`.
   saving) so you can see exactly where a build turn is.
 </Note>
 
+### The greeting acknowledgement
+
+On a follow-up turn, Genie streams a short **acknowledgement** ("Understood —
+building that now.") on a fast path *before* the classifier (the SUM) has decided
+what the turn is, so you get an instant response while the paid classification
+runs in parallel. Two refinements make it feel right:
+
+- **It knows what was just done.** The acknowledgement is given a little context
+  from the previous turns — but only the *delivered* summary text (the finish
+  response's build summary or chat-mode answer), pulled from the trusted DB
+  history, never from the client payload. Everything else (your messages, tool
+  calls, file diffs, dead/aborted turns) is dropped, and the block is capped at
+  ~1,500 characters over the last 3 messages. So "expand on that" or "now add a
+  footer" is acknowledged with continuity instead of in a vacuum, without
+  bloating the fast-path payload.
+- **It's hidden on chat-mode turns.** When the SUM ultimately routes a turn to
+  the research (question-answering) path rather than a build, the build-style
+  greeting would read as Genie answering — or asking back — right before the real
+  sourced answer arrives. Because the research path is the only one that runs the
+  `genie_agent`, a turn that carries a `genie_agent` part is definitionally
+  chat-mode, and the client uses that signal to suppress the greeting (on both
+  live and reloaded turns). There's a brief window on a live chat turn where the
+  greeting shows before `genie_agent` appears and it collapses away — inherent to
+  the parallel fast path, which can't know the turn is a question until the SUM
+  finishes.
+
 ### Streaming responses
 
 Genie's reply streams in token by token. The opening acknowledgement (a short
@@ -242,11 +268,19 @@ leaving an over-promising summary.
 
 When a build turn ends up producing **more than one** finish response — for
 example, a model that stops mid-build and gets rescued into wiring the app and
-summarizing — Genie renders the **most complete** card (the one carrying the most
-non-empty sections), not merely the last one. Selecting by content rather than
-recency stops a truncated late fragment from hiding the full summary, and the
-same part is the one a later optimistic-deploy revision rewrites, so the card you
-see and the card Genie edits are always the same.
+summarizing — Genie renders the **primary** card by delivery tier: a part that
+actually executed and persisted sections beats an input-only part beats an
+errored one, and within a tier the one with the most non-empty sections wins.
+Picking by delivery-then-content (not merely recency) stops a truncated late
+fragment, or a dead retry attempt's never-delivered input, from hiding the full
+summary — and the same part is the one a later optimistic-deploy revision
+rewrites, so the card you see and the card Genie edits are always the same.
+
+The summary is also **grounded in what actually shipped**. On a follow-up turn
+the finish model is told the authoritative outcome from the coding run's own
+result — not just "plan execution complete" — so a run that failed with zero
+changed files can no longer render a confident **What I built** card for work
+that never landed. If the code stage didn't ship, the card says so.
 
 A chat-mode answer is never allowed to land empty. If the model's forced final
 delivery comes back blank (a whitespace-only message still parses and would
@@ -285,6 +319,17 @@ Typed application errors bypass the disconnect poller and render their card
 immediately, so the chat never silently goes idle on a recognized failure. If
 credits drain mid-stream, the error comes down the durable stream and closes the
 turn cleanly with the same no-credits card.
+
+A turn's liveness is the durable workflow run's own status, so classifying a
+failed status read matters. A transient run-store blip is assumed **alive** (a
+momentary fault must never kill a live build), but a run that is genuinely
+**gone** — never persisted, or evicted/expired (`WorkflowRunNotFoundError`, or a
+stream reconnect's HTTP 404) — is treated as **terminal**. Without that
+distinction the status endpoint would report a stale `running` row forever (the
+client polling a corpse, composer locked) and the in-progress guard would pin the
+project in a phantom `GENIE_BUSY` 409 that never clears; classifying "gone" as
+terminal lets the client reconcile to the canonical row and steal a stale
+turn-lock instead of wedging.
 
 ## Everything is readable and editable by Genie
 

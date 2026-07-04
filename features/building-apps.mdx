@@ -194,7 +194,10 @@ try again later.
 <Note>
   The follow-up coding stage runs on a **durable** agent by default, so it has
   no wall-clock time budget — a long build folds into the durable run and cannot
-  be cut off by an 800-second limit.
+  be cut off by an 800-second limit. The same chunk-inactivity watchdog guards
+  the durable path's model step (a stalled stream is torn down in seconds rather
+  than running to the function wall and re-running three times), so "no time
+  budget" never means "a stuck run hangs for 40 minutes."
 </Note>
 
 ## Coding retries and self-healing
@@ -219,6 +222,36 @@ Genie can also heal itself mid-run. When a parallel batch fails a step but a
 later cleanup/reconcile pass fixes the divergence and the turn still ships, the
 card reads **"Done — Genie fixed itself"** (an emerald "Genie fixed itself"
 chip) instead of an amber partial — because the run genuinely recovered.
+
+### Escalating a platform block to the advisor
+
+The scoped agent has an **advisor** — a higher-reasoning consult it can escalate
+to when it's stuck. A background watchdog already escalates after N consecutive
+`bash`-only turns (a sign the agent is spinning). A **blocked platform resource**
+now escalates *immediately, on the very next turn*, no streak required — because
+the failure is unambiguous and a workaround would be wrong. A single classifier
+(used by both the AI-SDK and durable loops) fires on the deterministic rejection
+strings platform guards already emit — a protected / restricted / build-time-overlay
+path, a reserved-bucket violation, a "not exported by" missing-export — and on a
+`storage_agent` task that asks for a bucket other than the two reserved ones.
+Before this, the agent would silently reroute an upload to a different bucket,
+hand-roll an inline XHR, or fail the step without ever consulting the advisor;
+now it stops and asks for a real plan. (The classifier deliberately never fires
+on the advisor's or `mark_step_done`'s own output, so discussing a past block
+can't re-arm the escalation it just resolved.)
+
+### Orphan rescue is routing-aware
+
+After a successful build the scoped agent runs an **orphan-rescue** sub-run that
+wires up any newly-created component nobody imports. Deciding *where* an orphan
+should render used to lean on the plan's sibling `edit` file, which is often
+wrong — in one real run a `WeeklySummary` orphan was pointed at a generic
+loading stub (`Index.tsx`) instead of the actual routed page (`Dashboard.tsx` at
+`/`), so the agent had nowhere valid to wire it and the step blocked. Rescue now
+**inspects the app's routing tree** first (a pure static scan that finds router
+entry files by path or content signal and extracts route → component mappings in
+both JSX and object-config form) and widens its own write scope to include the
+real routed pages — so it wires the component into a page users actually reach.
 
 ## Parallel follow-up coding and merge
 
