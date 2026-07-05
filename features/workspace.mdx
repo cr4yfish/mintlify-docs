@@ -216,6 +216,69 @@ workspace-info block.
 The Billing card and nav entry appear only for owners with workspace billing
 enabled. Non-admins see a single error message.
 
+## Genie-assisted inputs
+
+Many workspace fields carry an **inline Genie AI assistant** — an opt-in sparkle
+button baked directly into the input so you can hand a value to the assistant
+without leaving the form or opening chat. This is the mechanism behind the
+standing product rule that difficult settings (and other content) should offer a
+one-click "help me with this" affordance.
+
+There are three variants, all sharing one headless core (`useGenieAssist` /
+`GenieAssistBar` in `genie-assist.tsx`), one server route, and one localized
+namespace (`GenieInput`, in `messages/{en,de}/genie-input.json`):
+
+| Primitive | Components | What Genie fills |
+| --- | --- | --- |
+| **Genie Input** | `<Input genieAi>` (`src/components/ui/input.tsx`) | A single text field. |
+| **Genie Controls** | `GenieRadioGroup`, `GenieCheckboxGroup`, `GenieSelect` | One or many options in a selection control. |
+| **Genie Form** | `<GenieForm>` (`src/components/ui/genie-form.tsx`) | Every field of a form at once. |
+
+Each is **additive and non-breaking**: without the `genieAi` prop (or with
+`enabled: false`) the control renders exactly like its plain shadcn equivalent,
+so wrapping an existing field never changes its behavior.
+
+### How it works
+
+At rest the field wears the workspace-chat-bar look with a Genie (sparkle)
+button at its end. Pressing it turns the field into a **one-line chat**: the
+trailing button becomes a cancel + submit pair, and whatever you type — plus the
+field's current value — is sent to the Genie agent under a **customized prompt**
+and a **structured-output JSON schema** (Genie is structured-output only). On
+success the result is written back into the field(s) and the bar returns to its
+resting state.
+
+- **Options and fields drive the schema.** A selection control derives its schema
+  (an enum of the option `value`s) and a form derives one optional string
+  property per field, so Genie can only return valid values and only sets what it
+  is confident about. The current selection/values are injected into the prompt so
+  Genie *refines* rather than blind-fills. Invalid or unknown values are discarded.
+- **Every data state is rendered** in a reserved-height status row so async
+  transitions never reflow the page: `loading` ("Genie is thinking…"), `success`,
+  `empty` ("Genie returned nothing…"), `error` + **Try again**, and `timeout` +
+  retry. In-flight requests abort on cancel, timeout (default 30 s), and unmount.
+
+### The server route
+
+All three variants call `POST /api/genie/input-assist`
+(`src/app/api/genie/input-assist/route.ts`). It requires a valid Auth0 session,
+validates and hard-caps the body (text/prompt 8k chars, schema 20k bytes; a
+missing schema returns **400**), and runs `generateObject` on the same Haiku
+model stack the workspace chat agent uses. A schema the model cannot satisfy
+returns **422**.
+
+The Workspace **PII settings → New custom rule** dialog is the first shipped
+consumer: it wraps its five fields (label, pattern, flags, confidence, action)
+in a `GenieForm`, so you can describe the PII to catch in plain language and have
+the whole rule filled in.
+
+<Tip>
+  Each variant has a dedicated harness — `/test/genie-input`,
+  `/test/genie-controls`, and `/test/genie-form` — with an offline **Use mock**
+  toggle that drives every UI state (success, empty, error, timeout, cancel) with
+  no LLM, plus a **Copy debug JSON** button.
+</Tip>
+
 ## Onboarding
 
 New users land in a short guided flow (`OnboardingFlow`) that collects a name,

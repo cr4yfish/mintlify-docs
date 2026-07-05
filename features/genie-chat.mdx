@@ -253,6 +253,16 @@ answer plus a "sources used" badge. The summary can include:
   from just those bullets; the primary button inserts a ready-to-use Version 2
   prompt into your chat input.
 - A **to-do list** you can check off, each item wired to an "Ask Genie" handoff.
+- A row of **"Pages I updated"** buttons — one per navigable route the turn
+  edited. Clicking one points the live preview at that route (and reveals the
+  mobile preview tab) so you see the change immediately. The buttons wait for the
+  authoritative code-graph result rather than guessing from filenames, since a
+  page's English file name can disagree with its registered route
+  (`Reservation.tsx` → `/reservierung`); until then they show a loading skeleton.
+- A **Refresh preview** button that pulls the latest build into the preview
+  iframe. A matching refresh button also sits on the preview placeholder once a
+  deploy has succeeded — it shares one grid cell with the loading title and
+  crossfades in, so it appears with zero layout shift.
 - On chat-mode turns, a **Continue with Genie AI** button that opens the
   assistant seeded with your question and its answer so you can keep going with
   full context.
@@ -350,3 +360,24 @@ inviting members or editing settings through confirmation cards.
 Read-only research tools (lookups, search) run without a confirmation, while
 anything that changes state routes through an interactive card that you confirm —
 and can edit — before it runs.
+
+### Your account settings
+
+The rule extends all the way to your own account. Genie can read and change the
+same settings you edit on the `/account/settings` (appearance) and
+`/account/profile` (name, email, avatar) pages, through two tools:
+
+- **`get_account_settings`** reads your current display name, profile email,
+  avatar URL, and UI theme. The assistant is told to call this before any change
+  so it can show the current value and avoid a no-op write.
+- **`update_account_settings`** is a partial write — it only touches the fields
+  you name, and returns the authoritative post-write state. When you change the
+  theme it reminds you to reload to see it apply.
+
+So "switch me to dark mode" or "rename me to Ada Lovelace" just works in chat.
+Both tools are **scoped to your own user id** (resolved from your session, never
+model-supplied), so the assistant can only ever read or edit *your* account;
+inputs are validated (email format, `http(s)`-only avatar URLs, length caps) and
+an invalid value is surfaced as an error rather than written. The profile email
+is your public/contact address — changing it does **not** change how you sign in,
+and Genie confirms identity fields with you first.

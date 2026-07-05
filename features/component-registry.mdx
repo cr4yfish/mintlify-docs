@@ -193,6 +193,9 @@ and a default destination path in the generated project.
 | --- | --- | --- |
 | `ai-chat` | ai-feature | A typed chat hook plus a streaming edge function — a full "add AI chat" feature. |
 | `pdf-compressor` | file-feature | Client-side utils, a hook, and a component — PDF compression with no edge function. |
+| `file-upload-progress` | file-feature | A hook + UI that uploads to Genie storage with a live progress bar, cancel, and size limits — via `uploadWithProgress` (signed one-shot URL + XHR), since the stock `storage.upload()` can't report progress. |
+| `private-mode-gate` | auth-feature | `<PrivateModeGate>` plus locked / pending-approval pages — a role-based access lock for private, invite-only, or internal apps. See [Genie Cloud](/features/genie-cloud#private-mode-and-first-login-onboarding). |
+| `onboarding-page` | auth-feature | `useOnboarding` + `<OnboardingGate>` + a themed onboarding page — a first-login flow that holds each new user once until they submit it. |
 
 <Tip>
   The animated React Bits entries (`BorderGlow`, `Carousel`, `CardSwap`, `TargetCursor`,

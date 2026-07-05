@@ -39,17 +39,17 @@ representative slice:
 
 | Category | Notable tools |
 |---|---|
-| Workspace | `list_workspaces`, `get_workspace_info`, `create_workspace`, `update_workspace_settings`, `get_workspace_billing`, `get_credit_usage`, `get_workspace_credits` |
-| Members & invites | `list_workspace_members`, `invite_workspace_member`, `invite_workspace_member_by_email`, `revoke_workspace_invite`, `update_workspace_member_role`, `remove_workspace_member` |
+| Workspace | `list_workspaces`, `list_user_workspaces`, `get_workspace_info`, `create_workspace`, `update_workspace`, `update_workspace_settings`, `get_workspace_billing`, `get_credit_usage`, `get_workspace_credits`, `get_recent_workspace_activity` |
+| Members & invites | `list_workspace_members`, `list_workspace_invites`, `invite_workspace_member`, `invite_workspace_member_by_email`, `revoke_workspace_invite`, `update_workspace_member_role`, `remove_workspace_member` |
 | Workspace MCP integrations | `list_workspace_mcp_servers`, `add_workspace_mcp_server`, `update_workspace_mcp_server`, `toggle_workspace_mcp_server`, `delete_workspace_mcp_server`, `test_workspace_mcp_server_connection` |
-| Projects | `list_latest_projects`, `search_projects`, `get_project`, `create_project`, `update_project`, `rename_project`, `archive_project` / `unarchive_project`, `delete_project`, `add_project_to_workspace`, `remove_project_from_workspace`, `get_project_seo_settings`, `update_project_seo_settings` |
+| Projects | `list_latest_projects`, `list_archived_projects`, `search_projects`, `get_project`, `get_project_messages`, `create_project`, `update_project`, `rename_project`, `archive_project` / `unarchive_project`, `delete_project`, `get_project_deletion_status`, `add_project_to_workspace`, `remove_project_from_workspace`, `get_project_seo_settings`, `update_project_seo_settings` |
 | Builds | `send_followup_prompt`, `get_project_status`, `get_project_deployment_status`, `get_project_deployment_plan`, `abort_project_build`, `suggest_project_prompts`, `show_preview`, `get_auto_mode_state`, `set_auto_mode`, `list_project_deployment_versions`, `rollback_project_deployment` |
-| Genie Cloud backend | `get_project_cloud_settings`, `add_project_role` / `delete_project_role`, `assign_project_role`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_project_users`, `list_project_cloud_functions`, `list_project_database_tables`, `get_project_database_table_preview`, `list_project_storage_files` |
+| Genie Cloud backend | `get_project_cloud_settings`, `add_project_role` / `delete_project_role`, `assign_project_role`, `remove_project_role_from_user`, `toggle_project_auth_provider`, `update_project_access_settings`, `approve_project_user`, `invite_project_users`, `list_project_members`, `list_project_cloud_functions`, `list_project_database_tables`, `get_project_database_table_preview`, `list_project_storage_files` |
 | Project secrets | `list_project_secrets`, `set_project_secret`, `delete_project_secret` |
 | Scheduled jobs (cron) | `list_scheduled_jobs`, `schedule_job`, `unschedule_job`, `run_scheduled_job_now` |
-| Workspace chat | `send_workspace_chat`, `create_workspace_chat`, `list_workspace_chats`, `search_workspace_chats`, `rename_workspace_chat`, `delete_workspace_chat` |
+| Workspace chat | `send_workspace_chat`, `create_workspace_chat`, `list_workspace_chats`, `get_workspace_chat`, `search_workspace_chats`, `rename_workspace_chat`, `delete_workspace_chat` |
 | Code graph | `query_project_code_graph` |
-| PII rules | `list_workspace_pii_rules`, `set_workspace_pii_rule`, `create_workspace_pii_rule`, `list_workspace_pii_detections`, `reset_workspace_pii_rules` |
+| PII rules | `list_workspace_pii_rules`, `set_workspace_pii_rule`, `create_workspace_pii_rule`, `update_workspace_pii_rule`, `delete_workspace_pii_rule`, `list_workspace_pii_detections`, `reset_workspace_pii_rules` |
 | Pricing | `get_genie_pricing` (live from Stripe, with a static fallback) |
 
 <Note>
