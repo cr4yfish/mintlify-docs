@@ -129,6 +129,46 @@ provider) is fully reachable by the Workspace Chat Agent through its secure
 actions, so you can ask Genie to manage app access rather than only clicking
 through Project Settings.
 
+### Private mode and first-login onboarding
+
+Two higher-level access features build on the role system, and both ship as
+**prebuilt registry blueprints** (category `auth-feature`) so the coding agent
+installs them with `add_registry_entry` instead of hand-writing guards, hooks,
+and pages on every build. Hand-writing these flows is now explicitly discouraged.
+
+- **`private-mode-gate`** locks an app to approved users only. Wrap the app with
+  `<PrivateModeGate>` and unauthenticated visitors get a themed **locked page**
+  ("this app is private") with a sign-in button; signed-in users who only hold
+  the default role and aren't verified get a **pending-approval** waiting screen
+  (with sign-out and re-check); approved users pass through. The verdict is
+  role-based via the provisioned `check_private_access()` helper (private mode
+  off, **or** admin, **or** `is_verified`) — never a bare login check, because
+  sign-up is open by design. An optional `requiredRole` prop locks an area to a
+  specific role. Use it for closed betas, invite-only access, or internal tools.
+- **`onboarding-page`** gives new users a first-login flow. Wrap the signed-in
+  shell with `<OnboardingGate>` and every new user is held on a themed onboarding
+  page after their first login until they submit it. Completion is tracked per
+  user in the project DB (`profiles.onboarding_complete`, flipped in the same
+  update that saves the answers), so it fires exactly once. The page renders a
+  display-name field plus any project-configured questions from the
+  `get_onboarding_config()` RPC; extra answers land in `profiles.custom_fields`.
+
+Neither gate needs a router — both swap content in place, so installation is
+"install + wrap `src/App.tsx`". When both are on they nest
+`<PrivateModeGate><OnboardingGate>…</OnboardingGate></PrivateModeGate>`.
+
+**Settings and management.** The **Project Settings → Onboarding** tab carries the
+default role, the onboarding toggle, and private-mode settings (verified role,
+auto-approved emails). Saving now **syncs the live Supabase instance
+automatically** (`syncProjectSettingsToSupabase`) — no manual "Re-run bootstrap"
+after changing these. Everything is also reachable through the Workspace Chat
+Agent: `get_project_cloud_settings` returns `accessSettings` and the `pendingUsers`
+awaiting approval, and three secure actions drive changes —
+`update_project_access_settings` (partial patch, incl. auto-approved emails),
+`approve_project_user` (approve one pending signup), and `invite_app_users`
+(pre-approve up to 20 emails, instantly approve any already waiting, and send each
+a localized invite email carrying the app's live URL).
+
 ## Storage
 
 Storage uses two reserved buckets: `public-assets` (public) and `private-storage` (private). Paths passed to `.upload(...)` are **project-relative** — the runtime deterministically prefixes the project id, and the storage RLS policies require the first path segment to equal the sub-project id, so you never prepend the project id or bucket name yourself.
